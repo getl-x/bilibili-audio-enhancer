@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         B站清澈人声-音量增强-动态音量平衡
 // @namespace    https://www.bilibili.com/
-// @version      1.11.7
-// @description  为B站播放器加入音频增强、自然响应动态响度平衡、滚轮音量增强及播放器内实时状态条
+// @version      1.11.10
+// @description  为B站播放器加入音频增强、自然响应动态响度平衡及播放器内实时状态条；滚轮调音量默认开启，且仅在网页全屏/全屏模式下由脚本接管，其余模式沿用B站原生滚轮逻辑
 // @license      MIT
 // @match        *://bilibili.com/*
 // @match        *://*.bilibili.com/*
@@ -32,6 +32,7 @@
   const BOOST_MIN_PERCENT = 100;
   const BOOST_MAX_PERCENT = 1000;
   const BOOST_STEP_RATIO = 1.1;
+  const WHEEL_VOLUME_DEFAULT_KEY = `${STORAGE_PREFIX}:wheel-volume-default-enabled`;
   const VOLUME_WHEEL_STEP_PERCENT = 5;
   const PLAYER_SELECTOR = '.bpx-player-container, .bilibili-player-video-wrap, #bilibili-player, .bilibili-player';
   const VOLUME_WHEEL_SELECTOR = [
@@ -50,12 +51,14 @@
   let statusHudEnabled = loadStatusHudEnabled();
   let statusHudOpacity = loadStatusHudOpacity();
   let boostLimiterEnabled = loadBoostLimiterEnabled();
+  let wheelVolumeDefaultEnabled = loadWheelVolumeDefault();
   const DEFAULT_SETTINGS = {
     gainDB: 0,
     voicePreset: 'off',
     normalizerEnabled: defaultNormalizerEnabled,
     loudnessPreset: defaultLoudnessPreset,
     boostPercent: BOOST_MIN_PERCENT,
+    wheelVolumeEnabled: wheelVolumeDefaultEnabled,
   };
   const LOUDNESS_PRESETS = {
     comfortable: -16,
@@ -182,6 +185,7 @@
   const normalizerSpeedMenuIds = new Map();
   const statusHudMenuIds = new Map();
   const boostMenuIds = new Map();
+  const wheelVolumeMenuIds = new Map();
   let statusHud = null;
   let statusRefs = {};
   let statusHudTimer = null;
@@ -269,6 +273,15 @@
 
   function saveBoostLimiterEnabled(value) {
     writeSetting(BOOST_LIMITER_KEY, Boolean(value));
+  }
+
+  function loadWheelVolumeDefault() {
+    // 默认开启；因为滚轮只在网页全屏/全屏下才由脚本接管，普通模式下不会影响 B站 原生滚轮行为
+    return readSetting(WHEEL_VOLUME_DEFAULT_KEY, true, asBoolean);
+  }
+
+  function saveWheelVolumeDefault(value) {
+    writeSetting(WHEEL_VOLUME_DEFAULT_KEY, Boolean(value));
   }
 
   function clamp(value, min, max) {
@@ -780,7 +793,35 @@
     });
   }
 
+  // 仅在「网页全屏 / 全屏」下由脚本接管滚轮；普通、宽屏、小窗等模式交回 B站 原生滚轮逻辑。
+  // 依次判断：原生全屏 API → B站播放器 data-screen 属性 → 类名兜底 → 播放器是否铺满视口。
+  function isImmersivePlayback(video, player) {
+    if (document.fullscreenElement || document.webkitFullscreenElement
+      || document.mozFullScreenElement || document.msFullscreenElement) return true;
+
+    const container = (player && player.closest && player.closest('.bpx-player-container'))
+      || (video && video.closest && video.closest('.bpx-player-container'))
+      || null;
+    const screen = container && container.getAttribute('data-screen');
+    // data-screen: normal=普通, web=网页全屏, full=全屏, mini=小窗
+    if (screen) return screen === 'web' || screen === 'full';
+
+    // 兜底 1：B站改属性名时，用播放器/页面的类名判断
+    const classHint = `${container ? container.className : ''} ${player ? player.className : ''}`
+      + ` ${document.body ? document.body.className : ''}`;
+    if (/webfull|web-full|fullscreen|screen-full/i.test(classHint)) return true;
+
+    // 兜底 2：播放器铺满视口时视为沉浸模式（网页全屏/全屏都会铺满，宽屏模式高度不足）
+    if (player && player.getBoundingClientRect) {
+      const rect = player.getBoundingClientRect();
+      if (rect.width >= window.innerWidth * 0.98 && rect.height >= window.innerHeight * 0.9) return true;
+    }
+    return false;
+  }
+
   function handleVolumeWheel(event) {
+    // 滚轮调音量默认关闭，未在油猴菜单开启时完全交还浏览器原生滚轮行为
+    if (!settings.wheelVolumeEnabled) return;
     if (!Number.isFinite(event.deltaY) || event.deltaY === 0 || event.ctrlKey || event.metaKey) return;
     const target = event.target instanceof Element ? event.target : null;
     if (!target) return;
@@ -792,6 +833,8 @@
       ? target
       : findVideoForControl(player || directVolumeControl, !player);
     if (!video) return;
+    // 非网页全屏/全屏时不拦截事件，交由 B站 原生滚轮调音量逻辑处理
+    if (!isImmersivePlayback(video, player)) return;
     const volumeControl = directVolumeControl || (player && player.querySelector(VOLUME_WHEEL_SELECTOR));
     resetSettingsForNewVideo();
     lastVolumeControl = volumeControl;
@@ -2030,6 +2073,23 @@
     });
   }
 
+  function registerWheelVolumeMenu() {
+    if (typeof GM_registerMenuCommand !== 'function') return;
+
+    const label = `${wheelVolumeDefaultEnabled ? '☑' : '☐'} 滚轮调音量默认：${wheelVolumeDefaultEnabled ? '开启' : '关闭'}`;
+    updateMenuCommand(wheelVolumeMenuIds, 'enabled', label, () => {
+      wheelVolumeDefaultEnabled = !wheelVolumeDefaultEnabled;
+      DEFAULT_SETTINGS.wheelVolumeEnabled = wheelVolumeDefaultEnabled;
+      saveWheelVolumeDefault(wheelVolumeDefaultEnabled);
+      settings.wheelVolumeEnabled = wheelVolumeDefaultEnabled;
+      if (!settings.wheelVolumeEnabled) hideVolumeOsd();
+      registerWheelVolumeMenu();
+    }, {
+      autoClose: false,
+      title: '切换新视频打开时是否默认允许在网页全屏/全屏下用滚轮调节播放器音量（默认开启）',
+    });
+  }
+
   function isVisible(element) {
     if (!element || !element.isConnected) return false;
     const rect = element.getBoundingClientRect();
@@ -2380,6 +2440,7 @@
     registerNormalizerSpeedMenu();
     registerStatusHudMenu();
     registerBoostMenu();
+    registerWheelVolumeMenu();
     if (!statusHudTimer) {
       statusHudTimer = setInterval(() => {
         syncStatusHud();
