@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站清澈人声-音量增强-动态音量平衡
 // @namespace    https://www.bilibili.com/
-// @version      1.15.1
+// @version      1.15.2
 // @description  为B站视频页与直播间播放器加入音频增强、自然响应动态响度平衡及播放器内实时状态条；网页全屏/全屏下由脚本接管滚轮（每次 1%）与上下方向键（每次 5%）调音量，普通模式沿用B站原生逻辑
 // @license      MIT
 // @match        *://bilibili.com/*
@@ -200,6 +200,10 @@
   let toolbarScanScheduled = false;
   let toolbarFullScanAt = 0;
   const toolbarParents = new Set();
+  // 直播间：脚本按钮挂在常驻叠加层里，不会自动跟着控制栏隐藏，这里记录按钮与其真正的控制栏宿主
+  const liveToolbarButtons = new Set();
+  let liveBarHost = null;
+  let liveHideObserver = null;
   const normalizerDefaultMenuIds = new Map();
   const normalizerSpeedMenuIds = new Map();
   const statusHudMenuIds = new Map();
@@ -1302,6 +1306,8 @@
       }
       .${PREFIX}-live-toolbar-svg { display: block; width: 100%; height: 100%; }
       .${PREFIX}-live-toolbar-svg > .${PREFIX}-toolbar-icon { height: 100%; }
+      /* 控制栏隐藏时，脚本按钮跟着一起隐藏（叠加层本身不会隐藏） */
+      .${PREFIX}-live-toolbar.fx-bar-hidden { display: none !important; }
       .${PREFIX}-toolbar.fx-feature-enabled .${PREFIX}-live-toolbar-svg::after {
         content: "";
         position: absolute;
@@ -2283,6 +2289,47 @@
     return true;
   }
 
+  // 直播间：判断真正的控制栏（.web-player-controller-bg）当前是否隐藏
+  function isLiveControlBarHidden() {
+    if (!liveBarHost || !liveBarHost.isConnected) return false;
+    const style = getComputedStyle(liveBarHost);
+    if (!style) return false;
+    if (style.display === 'none' || style.visibility === 'hidden') return true;
+    const opacity = Number.parseFloat(style.opacity);
+    return Number.isFinite(opacity) && opacity <= 0.05;
+  }
+
+  // 直播间：脚本按钮挂在常驻叠加层（#web-player-controller-wrap-el）里，控制栏隐藏时不会自动跟着隐藏，
+  // 所以手动跟随控制栏的显隐状态，否则控制栏藏起来后按钮还留在画面上。
+  function syncLiveToolbarVisibility() {
+    const hidden = isLiveControlBarHidden();
+    for (const button of liveToolbarButtons) {
+      if (!button.isConnected) {
+        liveToolbarButtons.delete(button);
+        continue;
+      }
+      button.classList.toggle('fx-bar-hidden', hidden);
+    }
+  }
+
+  function observeLiveControlBar(host) {
+    if (!host || host === liveBarHost) {
+      syncLiveToolbarVisibility();
+      return;
+    }
+    liveBarHost = host;
+    if (liveHideObserver) {
+      liveHideObserver.disconnect();
+      liveHideObserver = null;
+    }
+    // 控制栏的显隐是在这个元素上切 style/class，监听变化即可，不必轮询
+    if (typeof MutationObserver === 'function') {
+      liveHideObserver = new MutationObserver(syncLiveToolbarVisibility);
+      liveHideObserver.observe(host, { attributes: true, attributeFilter: ['style', 'class'] });
+    }
+    syncLiveToolbarVisibility();
+  }
+
   // 在同一父节点内保证「音频增强」「动态音量」两个按钮存在（视频页与直播间共用），返回这两个按钮
   function ensureToolbarPair(parent, insertionTarget, nativeClasses, liveMode) {
     let normalizerButton = parent.querySelector(`:scope > [data-${PREFIX}-normalizer-toolbar="1"]`);
@@ -2367,8 +2414,8 @@
     }
 
     // 直播间：控制栏是播放器 SDK 运行时创建的 Svelte 节点，内部类名带哈希、没有 bpx 图标节点，
-    // 所以不猜「音量按钮」，直接把两个按钮插到稳定宿主 #web-player-controller-wrap-el 的最前面（控制栏左端）。
-    // 控制栏显隐是在宿主自身上切 visibility，子节点会跟着一起显隐。
+    // 所以不猜「音量按钮」，而是把两个按钮插到稳定宿主 #web-player-controller-wrap-el（常驻叠加层）里，
+    // 再用 CSS 显示在控制栏上方，避免与原生控件重叠。
     const liveBar = document.getElementById(LIVE_CONTROL_BAR_ID);
     if (liveBar) {
       toolbarParents.add(liveBar);
@@ -2378,6 +2425,10 @@
         liveBar.insertBefore(normalizerButton, liveBar.firstChild);
         liveBar.insertBefore(enhancerButton, liveBar.firstChild);
       }
+      liveToolbarButtons.add(enhancerButton);
+      liveToolbarButtons.add(normalizerButton);
+      // 叠加层是常驻的，控制栏隐藏时它不会隐藏，所以这里跟随真正的控制栏（.web-player-controller-bg）的显隐
+      observeLiveControlBar(document.querySelector('.web-player-controller-bg'));
     }
 
     syncToolbarButtons();
