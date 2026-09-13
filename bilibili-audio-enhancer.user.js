@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站清澈人声-音量增强-动态音量平衡
 // @namespace    https://www.bilibili.com/
-// @version      1.15.2
+// @version      1.15.3
 // @description  为B站视频页与直播间播放器加入音频增强、自然响应动态响度平衡及播放器内实时状态条；网页全屏/全屏下由脚本接管滚轮（每次 1%）与上下方向键（每次 5%）调音量，普通模式沿用B站原生逻辑
 // @license      MIT
 // @match        *://bilibili.com/*
@@ -48,9 +48,11 @@
     '#live-player',
     '.live-player-mounter',
   ].join(',');
-  // 直播间播放器根（模式类标在它身上）与控制栏宿主（播放器 SDK 运行时创建，id 稳定）
+  // 直播间播放器根（模式类标在它身上）与真正承载控制栏的那一层（播放器 SDK 运行时创建，隐藏时子节点跟着隐藏）
   const LIVE_PLAYER_CONTAINER_SELECTOR = '#live-player-ctnr, .live-player-ctnr';
-  const LIVE_CONTROL_BAR_ID = 'web-player-controller-wrap-el';
+  const LIVE_CONTROL_BAR_SELECTOR = '.web-player-controller-bg';
+  // 直播间按钮在控制栏内的占位宽度（逐个向右排）
+  const LIVE_TOOLBAR_SLOT_PX = 42;
   // 直播间的模式类：normal=普通模式，其余（web-full / fullscreen 等）按沉浸处理
   const LIVE_NORMAL_CLASS = 'normal';
   const LIVE_IMMERSIVE_CLASS_PATTERN = /webfull|web-full|screen-full|fullscreen|^full$|^web$/i;
@@ -200,10 +202,10 @@
   let toolbarScanScheduled = false;
   let toolbarFullScanAt = 0;
   const toolbarParents = new Set();
-  // 直播间：脚本按钮挂在常驻叠加层里，不会自动跟着控制栏隐藏，这里记录按钮与其真正的控制栏宿主
+  // 直播间：脚本按钮的父节点是控制栏本身（跟着控制栏一起显隐），这里记录按钮与控制栏宿主
   const liveToolbarButtons = new Set();
-  let liveBarHost = null;
-  let liveHideObserver = null;
+  let liveControlBar = null;
+  let liveControlBarObserver = null;
   const normalizerDefaultMenuIds = new Map();
   const normalizerSpeedMenuIds = new Map();
   const statusHudMenuIds = new Map();
@@ -1279,12 +1281,12 @@
         background: #00aeec;
         box-shadow: 0 0 0 1px rgba(0, 0, 0, .45);
       }
-      /* 直播间：控制栏宿主 (#web-player-controller-wrap-el) 只是个空壳层，原生控制栏内容不在它里面，
-         左侧又是原生按钮所在，所以把按钮抬到控制栏上方，物理上不会与任何原生控件重叠。
-         控制栏约 56px 高（SDK 给背景层写的固定高度），这里留出余量。 */
+      /* 直播间：按钮插在控制栏（.web-player-controller-bg）内部，垂直居中；
+         水平位置由 layoutLiveToolbar() 在运行时排在原生控件右侧（原生控件靠左排列，右侧是空的）。
+         控制栏隐藏时自身 display:none / visibility:hidden，按钮作为子节点自动跟着隐藏。 */
       .${PREFIX}-live-toolbar {
         position: absolute;
-        bottom: 64px;
+        top: 50%;
         z-index: 14;
         display: flex !important;
         align-items: center;
@@ -1292,11 +1294,9 @@
         width: 36px;
         height: 32px;
         border-radius: 4px;
-        background: rgba(0, 0, 0, .42);
         color: rgba(255, 255, 255, .9);
+        transform: translateY(-50%);
       }
-      .${PREFIX}-live-toolbar[data-${PREFIX}-toolbar="1"] { left: 8px; }
-      .${PREFIX}-live-toolbar[data-${PREFIX}-normalizer-toolbar="1"] { left: 48px; }
       .${PREFIX}-live-toolbar-icon {
         display: flex;
         align-items: center;
@@ -1306,8 +1306,6 @@
       }
       .${PREFIX}-live-toolbar-svg { display: block; width: 100%; height: 100%; }
       .${PREFIX}-live-toolbar-svg > .${PREFIX}-toolbar-icon { height: 100%; }
-      /* 控制栏隐藏时，脚本按钮跟着一起隐藏（叠加层本身不会隐藏） */
-      .${PREFIX}-live-toolbar.fx-bar-hidden { display: none !important; }
       .${PREFIX}-toolbar.fx-feature-enabled .${PREFIX}-live-toolbar-svg::after {
         content: "";
         position: absolute;
@@ -2289,45 +2287,57 @@
     return true;
   }
 
-  // 直播间：判断真正的控制栏（.web-player-controller-bg）当前是否隐藏
-  function isLiveControlBarHidden() {
-    if (!liveBarHost || !liveBarHost.isConnected) return false;
-    const style = getComputedStyle(liveBarHost);
-    if (!style) return false;
-    if (style.display === 'none' || style.visibility === 'hidden') return true;
-    const opacity = Number.parseFloat(style.opacity);
-    return Number.isFinite(opacity) && opacity <= 0.05;
-  }
-
-  // 直播间：脚本按钮挂在常驻叠加层（#web-player-controller-wrap-el）里，控制栏隐藏时不会自动跟着隐藏，
-  // 所以手动跟随控制栏的显隐状态，否则控制栏藏起来后按钮还留在画面上。
-  function syncLiveToolbarVisibility() {
-    const hidden = isLiveControlBarHidden();
-    for (const button of liveToolbarButtons) {
-      if (!button.isConnected) {
-        liveToolbarButtons.delete(button);
-        continue;
-      }
-      button.classList.toggle('fx-bar-hidden', hidden);
+  // 直播间：量出控制栏里原生控件占据到的最右边缘
+  // （原生控件靠左排列，右侧是空的；用带尺寸的最小元素避免把整行容器算进去）
+  function measureLiveNativesRight(bar, barRect) {
+    let right = 0;
+    for (const node of bar.querySelectorAll('button, i, svg, span, img, canvas')) {
+      if (liveToolbarButtons.has(node)) continue;
+      if (node.closest(`[data-${PREFIX}-toolbar="1"]`)
+        || node.closest(`[data-${PREFIX}-normalizer-toolbar="1"]`)) continue;
+      const rect = node.getBoundingClientRect();
+      if (rect.width < 4 || rect.height < 4) continue;
+      if (rect.left < barRect.left - 1 || rect.right > barRect.right + 1) continue;
+      right = Math.max(right, rect.right - barRect.left);
     }
+    return right;
   }
 
-  function observeLiveControlBar(host) {
-    if (!host || host === liveBarHost) {
-      syncLiveToolbarVisibility();
+  // 直播间：把两个按钮排在控制栏内原生控件的右侧，避免重叠
+  function layoutLiveToolbar() {
+    const bar = liveControlBar;
+    if (!bar || !bar.isConnected) return;
+    const buttons = [...liveToolbarButtons].filter((button) => button.isConnected);
+    if (!buttons.length) return;
+    const barRect = bar.getBoundingClientRect();
+    // 控制栏隐藏（display:none / 未挂载完）时量不到尺寸，等它显示后由 observer 再排一次
+    if (barRect.width < 60 || barRect.height < 12) return;
+    const totalWidth = buttons.length * LIVE_TOOLBAR_SLOT_PX;
+    const minLeft = Math.max(6, Math.round(measureLiveNativesRight(bar, barRect) + 8));
+    const maxLeft = Math.max(6, Math.round(barRect.width - totalWidth - 6));
+    const left = Math.min(minLeft, maxLeft);
+    buttons.forEach((button, index) => {
+      button.style.left = `${left + index * LIVE_TOOLBAR_SLOT_PX}px`;
+    });
+  }
+
+  // 控制栏本身会显隐（隐藏时子节点跟着隐藏），但它重新显示时尺寸才可用，所以监听它的 style/class 变化补排一次
+  function observeLiveControlBar(bar) {
+    if (!bar) return;
+    if (bar === liveControlBar) {
+      layoutLiveToolbar();
       return;
     }
-    liveBarHost = host;
-    if (liveHideObserver) {
-      liveHideObserver.disconnect();
-      liveHideObserver = null;
+    liveControlBar = bar;
+    if (liveControlBarObserver) {
+      liveControlBarObserver.disconnect();
+      liveControlBarObserver = null;
     }
-    // 控制栏的显隐是在这个元素上切 style/class，监听变化即可，不必轮询
     if (typeof MutationObserver === 'function') {
-      liveHideObserver = new MutationObserver(syncLiveToolbarVisibility);
-      liveHideObserver.observe(host, { attributes: true, attributeFilter: ['style', 'class'] });
+      liveControlBarObserver = new MutationObserver(layoutLiveToolbar);
+      liveControlBarObserver.observe(bar, { attributes: true, attributeFilter: ['style', 'class'] });
     }
-    syncLiveToolbarVisibility();
+    layoutLiveToolbar();
   }
 
   // 在同一父节点内保证「音频增强」「动态音量」两个按钮存在（视频页与直播间共用），返回这两个按钮
@@ -2414,9 +2424,9 @@
     }
 
     // 直播间：控制栏是播放器 SDK 运行时创建的 Svelte 节点，内部类名带哈希、没有 bpx 图标节点，
-    // 所以不猜「音量按钮」，而是把两个按钮插到稳定宿主 #web-player-controller-wrap-el（常驻叠加层）里，
-    // 再用 CSS 显示在控制栏上方，避免与原生控件重叠。
-    const liveBar = document.getElementById(LIVE_CONTROL_BAR_ID);
+    // 所以不猜「音量按钮」，而是把两个按钮插进控制栏本身（.web-player-controller-bg）：
+    // 它在隐藏时子节点跟着隐藏（显隐天然同步），位置由 layoutLiveToolbar() 在运行时排在原生控件右侧。
+    const liveBar = document.querySelector(LIVE_CONTROL_BAR_SELECTOR);
     if (liveBar) {
       toolbarParents.add(liveBar);
       const { enhancerButton, normalizerButton } = ensureToolbarPair(liveBar, liveBar, [], true);
@@ -2427,8 +2437,7 @@
       }
       liveToolbarButtons.add(enhancerButton);
       liveToolbarButtons.add(normalizerButton);
-      // 叠加层是常驻的，控制栏隐藏时它不会隐藏，所以这里跟随真正的控制栏（.web-player-controller-bg）的显隐
-      observeLiveControlBar(document.querySelector('.web-player-controller-bg'));
+      observeLiveControlBar(liveBar);
     }
 
     syncToolbarButtons();
@@ -2668,11 +2677,15 @@
     document.addEventListener('webkitfullscreenchange', closeNormalizerPanel);
     document.addEventListener('fullscreenchange', () => requestAnimationFrame(syncStatusHud));
     document.addEventListener('webkitfullscreenchange', () => requestAnimationFrame(syncStatusHud));
+    // 直播间按钮的水平位置是按控制栏实测宽度算的，尺寸变化后要重排
+    document.addEventListener('fullscreenchange', () => requestAnimationFrame(layoutLiveToolbar));
+    document.addEventListener('webkitfullscreenchange', () => requestAnimationFrame(layoutLiveToolbar));
     document.addEventListener('fullscreenchange', hideVolumeOsd);
     document.addEventListener('webkitfullscreenchange', hideVolumeOsd);
     window.addEventListener('resize', hideVolumeOsd, { passive: true });
     window.addEventListener('scroll', hideVolumeOsd, { capture: true, passive: true });
     window.addEventListener('resize', syncStatusHud, { passive: true });
+    window.addEventListener('resize', layoutLiveToolbar, { passive: true });
     window.addEventListener('popstate', resetSettingsForNewVideo);
 
     let lastMutationTime = 0;
