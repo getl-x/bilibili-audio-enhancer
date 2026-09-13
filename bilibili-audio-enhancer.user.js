@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站清澈人声-音量增强-动态音量平衡
 // @namespace    https://www.bilibili.com/
-// @version      1.15.5
+// @version      1.15.6
 // @description  为B站视频页与直播间播放器加入音频增强、自然响应动态响度平衡及播放器内实时状态条；网页全屏/全屏下由脚本接管滚轮（每次 1%）与上下方向键（每次 5%）调音量，普通模式沿用B站原生逻辑
 // @license      MIT
 // @match        *://bilibili.com/*
@@ -51,6 +51,9 @@
   // 直播间播放器根（模式类标在它身上）与真正承载控制栏的那一层（播放器 SDK 运行时创建，隐藏时子节点跟着隐藏）
   const LIVE_PLAYER_CONTAINER_SELECTOR = '#live-player-ctnr, .live-player-ctnr';
   const LIVE_CONTROL_BAR_SELECTOR = '.web-player-controller-bg';
+  // 直播间按钮自身的尺寸与间距（位置取自锚点，这两个值只决定我们自己的框）
+  const LIVE_TOOLBAR_SIZE_PX = 34;
+  const LIVE_TOOLBAR_GAP_PX = 6;
   // 直播间的模式类：normal=普通模式，其余（web-full / fullscreen 等）按沉浸处理
   const LIVE_NORMAL_CLASS = 'normal';
   const LIVE_IMMERSIVE_CLASS_PATTERN = /webfull|web-full|screen-full|fullscreen|^full$|^web$/i;
@@ -1275,15 +1278,16 @@
         background: #00aeec;
         box-shadow: 0 0 0 1px rgba(0, 0, 0, .45);
       }
-      /* 直播间：按钮作为控制栏内的普通子节点，参与控制栏自己的布局（与视频页「插在音量按钮左侧」同一思路），
-         不做绝对定位、不测坐标，因此不会压住原生控件；控制栏隐藏时作为子节点自动跟着隐藏。 */
+      /* 直播间：按钮是控制栏的子节点（随控制栏一起显隐），位置由脚本按锚点的实测矩形给出
+         —— 与锚点同一行、紧贴它右侧，因此不管控制栏内部是 flex 还是各控件绝对定位都能对齐。 */
       .${PREFIX}-live-toolbar {
+        position: absolute;
+        z-index: 14;
         display: flex !important;
         align-items: center;
         justify-content: center;
-        width: 36px;
+        width: 34px;
         height: 32px;
-        margin: 0 2px;
         color: rgba(255, 255, 255, .9);
       }
       .${PREFIX}-live-toolbar-icon {
@@ -2301,6 +2305,30 @@
     return deep ? deep.node : null;
   }
 
+  // 直播间：把按钮摆到锚点同一行、紧贴它右侧。
+  // 几何取自锚点自身的实测矩形（锚点是我们按尺寸挑出来的，矩形必然有效），
+  // 所以不管控制栏内部是 flex 流式还是各控件绝对定位，都能落在同一行。
+  function layoutLiveToolbarNextTo(anchor, bar, buttons) {
+    const barRect = bar.getBoundingClientRect();
+    const anchorRect = anchor.getBoundingClientRect();
+    if (barRect.width < 60 || anchorRect.width < 2 || anchorRect.height < 2) return;
+    const totalWidth = buttons.length * LIVE_TOOLBAR_SIZE_PX
+      + (buttons.length - 1) * LIVE_TOOLBAR_GAP_PX;
+    // 锚点右侧放不下就夹回控制栏内，避免越界看不见
+    const maxLeft = Math.max(0, Math.round(barRect.width - totalWidth - 4));
+    const startLeft = Math.min(
+      Math.round(anchorRect.right - barRect.left + LIVE_TOOLBAR_GAP_PX),
+      maxLeft,
+    );
+    buttons.forEach((button, index) => {
+      button.style.left = `${Math.max(0, startLeft
+        + index * (LIVE_TOOLBAR_SIZE_PX + LIVE_TOOLBAR_GAP_PX))}px`;
+      button.style.top = `${Math.round(anchorRect.top - barRect.top)}px`;
+      button.style.width = `${LIVE_TOOLBAR_SIZE_PX}px`;
+      button.style.height = `${Math.round(anchorRect.height)}px`;
+    });
+  }
+
   // 在同一父节点内保证「音频增强」「动态音量」两个按钮存在（视频页与直播间共用），返回这两个按钮
   function ensureToolbarPair(parent, insertionTarget, nativeClasses, liveMode) {
     let normalizerButton = parent.querySelector(`:scope > [data-${PREFIX}-normalizer-toolbar="1"]`);
@@ -2385,23 +2413,27 @@
     }
 
     // 直播间：控制栏是播放器 SDK 运行时创建的 Svelte 节点，内部类名带哈希、没有 bpx 图标节点，
-    // 认不出「音量按钮」，所以照搬视频页的思路 —— 取控制栏里最靠右的原生控件当锚点，
-    // 把两个按钮作为兄弟节点插在它左边：位置交给控制栏自己的布局，且同为控制栏子节点，随控制栏一起显隐。
+    // 认不出「音量按钮」；而且控制栏内部控件是各自绝对定位的，光把它们插进 DOM（流式）不会排在同一行。
+    // 所以分两步：① 作为兄弟节点插进控制栏（结构上属于控制栏，随控制栏一起显隐）；
+    //              ② 几何直接取自锚点自身的实测矩形 —— 与锚点同一行、紧贴它右侧，不受控制栏内部布局方式影响。
     const liveBar = document.querySelector(LIVE_CONTROL_BAR_SELECTOR);
     if (liveBar) {
       const anchor = findLiveToolbarAnchor(liveBar);
       const parent = (anchor && anchor.parentElement) || liveBar;
       toolbarParents.add(parent);
       const { enhancerButton, normalizerButton } = ensureToolbarPair(parent, anchor || liveBar, [], true);
+      const buttons = [enhancerButton, normalizerButton];
       if (anchor) {
-        if (enhancerButton.nextElementSibling !== normalizerButton
-          || normalizerButton.nextElementSibling !== anchor) {
-          // 与视频页一致：先插增强、再插动态音量，保证顺序是「增强、动态音量、锚点」
-          parent.insertBefore(enhancerButton, anchor);
-          parent.insertBefore(normalizerButton, anchor);
+        if (enhancerButton.previousElementSibling !== anchor
+          || normalizerButton.previousElementSibling !== enhancerButton) {
+          // 参照节点只取一次：第一次插入后 anchor.nextElementSibling 就变了
+          const after = anchor.nextElementSibling;
+          parent.insertBefore(enhancerButton, after);
+          parent.insertBefore(normalizerButton, after);
         }
+        layoutLiveToolbarNextTo(anchor, liveBar, buttons);
       } else if (parent.lastElementChild !== normalizerButton) {
-        // 控制栏还没渲染出原生控件（隐藏中）时先追加到末尾，等下一次扫描拿到锚点再插到它左边
+        // 控制栏还没渲染出原生控件（隐藏中）时先追加到末尾，等下一次扫描拿到锚点再摆到它右边
         parent.appendChild(enhancerButton);
         parent.appendChild(normalizerButton);
       }
