@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站清澈人声-音量增强-动态音量平衡
 // @namespace    https://www.bilibili.com/
-// @version      1.15.0
+// @version      1.15.1
 // @description  为B站视频页与直播间播放器加入音频增强、自然响应动态响度平衡及播放器内实时状态条；网页全屏/全屏下由脚本接管滚轮（每次 1%）与上下方向键（每次 5%）调音量，普通模式沿用B站原生逻辑
 // @license      MIT
 // @match        *://bilibili.com/*
@@ -1275,16 +1275,20 @@
         background: #00aeec;
         box-shadow: 0 0 0 1px rgba(0, 0, 0, .45);
       }
-      /* 直播间：控制栏宿主 (#web-player-controller-wrap-el) 高度由内部内容决定，用底边定位更稳 */
+      /* 直播间：控制栏宿主 (#web-player-controller-wrap-el) 只是个空壳层，原生控制栏内容不在它里面，
+         左侧又是原生按钮所在，所以把按钮抬到控制栏上方，物理上不会与任何原生控件重叠。
+         控制栏约 56px 高（SDK 给背景层写的固定高度），这里留出余量。 */
       .${PREFIX}-live-toolbar {
         position: absolute;
-        bottom: 14px;
+        bottom: 64px;
         z-index: 14;
         display: flex !important;
         align-items: center;
         justify-content: center;
         width: 36px;
         height: 32px;
+        border-radius: 4px;
+        background: rgba(0, 0, 0, .42);
         color: rgba(255, 255, 255, .9);
       }
       .${PREFIX}-live-toolbar[data-${PREFIX}-toolbar="1"] { left: 8px; }
