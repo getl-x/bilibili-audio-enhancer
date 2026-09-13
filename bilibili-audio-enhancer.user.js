@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站清澈人声-音量增强-动态音量平衡
 // @namespace    https://www.bilibili.com/
-// @version      1.15.3
+// @version      1.15.4
 // @description  为B站视频页与直播间播放器加入音频增强、自然响应动态响度平衡及播放器内实时状态条；网页全屏/全屏下由脚本接管滚轮（每次 1%）与上下方向键（每次 5%）调音量，普通模式沿用B站原生逻辑
 // @license      MIT
 // @match        *://bilibili.com/*
@@ -1287,6 +1287,7 @@
       .${PREFIX}-live-toolbar {
         position: absolute;
         top: 50%;
+        right: 8px;
         z-index: 14;
         display: flex !important;
         align-items: center;
@@ -1296,6 +1297,14 @@
         border-radius: 4px;
         color: rgba(255, 255, 255, .9);
         transform: translateY(-50%);
+      }
+      /* 原生控件右侧放不下时（layoutLiveToolbar 判定），退回控制栏上方，保证不盖住原生控件 */
+      .${PREFIX}-live-toolbar.fx-above-bar {
+        top: auto;
+        right: auto;
+        bottom: calc(100% + 6px);
+        background: rgba(0, 0, 0, .42);
+        transform: none;
       }
       .${PREFIX}-live-toolbar-icon {
         display: flex;
@@ -2288,22 +2297,26 @@
   }
 
   // 直播间：量出控制栏里原生控件占据到的最右边缘
-  // （原生控件靠左排列，右侧是空的；用带尺寸的最小元素避免把整行容器算进去）
+  // 做法：扫描控制栏内所有元素，只认「窄元素」（单个控件或一小段控件组，宽度不超过控制栏一半）——
+  // 整行的容器宽度接近控制栏宽度，会被排除，避免把它当成原生控件的右边缘。
   function measureLiveNativesRight(bar, barRect) {
     let right = 0;
-    for (const node of bar.querySelectorAll('button, i, svg, span, img, canvas')) {
+    const maxControlWidth = barRect.width * 0.5;
+    for (const node of bar.querySelectorAll('*')) {
       if (liveToolbarButtons.has(node)) continue;
       if (node.closest(`[data-${PREFIX}-toolbar="1"]`)
         || node.closest(`[data-${PREFIX}-normalizer-toolbar="1"]`)) continue;
       const rect = node.getBoundingClientRect();
-      if (rect.width < 4 || rect.height < 4) continue;
+      if (rect.width < 2 || rect.height < 2) continue;
+      if (rect.width > maxControlWidth) continue;
       if (rect.left < barRect.left - 1 || rect.right > barRect.right + 1) continue;
       right = Math.max(right, rect.right - barRect.left);
     }
     return right;
   }
 
-  // 直播间：把两个按钮排在控制栏内原生控件的右侧，避免重叠
+  // 直播间：把两个按钮排在控制栏内原生控件的右侧；右侧放不下时退回「控制栏上方」，
+  // 总之不会盖住原生控件（两种位置都仍是控制栏的子节点，随控制栏一起显隐）
   function layoutLiveToolbar() {
     const bar = liveControlBar;
     if (!bar || !bar.isConnected) return;
@@ -2313,11 +2326,18 @@
     // 控制栏隐藏（display:none / 未挂载完）时量不到尺寸，等它显示后由 observer 再排一次
     if (barRect.width < 60 || barRect.height < 12) return;
     const totalWidth = buttons.length * LIVE_TOOLBAR_SLOT_PX;
-    const minLeft = Math.max(6, Math.round(measureLiveNativesRight(bar, barRect) + 8));
-    const maxLeft = Math.max(6, Math.round(barRect.width - totalWidth - 6));
-    const left = Math.min(minLeft, maxLeft);
+    const nativesRight = measureLiveNativesRight(bar, barRect);
+    // 三种情况：① 量到原生控件且右侧放得下 → 排在原生控件右侧；
+    //           ② 量到原生控件但右侧放不下 → 退回控制栏上方（不盖住原生控件）；
+    //           ③ 完全量不到（隐藏中/结构变了）→ 放到控制栏最右侧，绝不默认落在左边的原生控件上。
+    const fitsRight = nativesRight > 0 && barRect.width - nativesRight >= totalWidth + 12;
+    const aboveBar = !fitsRight && nativesRight > 0;
+    const baseLeft = fitsRight
+      ? Math.round(nativesRight + 8)
+      : (aboveBar ? 6 : Math.round(Math.max(6, barRect.width - totalWidth - 8)));
     buttons.forEach((button, index) => {
-      button.style.left = `${left + index * LIVE_TOOLBAR_SLOT_PX}px`;
+      button.classList.toggle('fx-above-bar', aboveBar);
+      button.style.left = `${baseLeft + index * LIVE_TOOLBAR_SLOT_PX}px`;
     });
   }
 
