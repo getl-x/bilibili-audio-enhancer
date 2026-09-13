@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         B站清澈人声-音量增强-动态音量平衡
 // @namespace    https://www.bilibili.com/
-// @version      1.11.10
-// @description  为B站播放器加入音频增强、自然响应动态响度平衡及播放器内实时状态条；滚轮调音量默认开启，且仅在网页全屏/全屏模式下由脚本接管，其余模式沿用B站原生滚轮逻辑
+// @version      1.14.0
+// @description  为B站播放器加入音频增强、自然响应动态响度平衡及播放器内实时状态条；网页全屏/全屏下由脚本接管滚轮（每次 1%）与上下方向键（每次 5%）调音量，普通模式沿用B站原生逻辑
 // @license      MIT
 // @match        *://bilibili.com/*
 // @match        *://*.bilibili.com/*
@@ -33,7 +33,10 @@
   const BOOST_MAX_PERCENT = 1000;
   const BOOST_STEP_RATIO = 1.1;
   const WHEEL_VOLUME_DEFAULT_KEY = `${STORAGE_PREFIX}:wheel-volume-default-enabled`;
-  const VOLUME_WHEEL_STEP_PERCENT = 5;
+  // 100% 以内每次调整的档位：滚轮 1%，上下方向键 5%（贴近 B站 原生手感）
+  const VOLUME_STEP_PERCENT = 1;
+  const VOLUME_KEY_STEP_PERCENT = 5;
+  const VOLUME_KEY_REPEAT_INTERVAL_MS = 90;
   const PLAYER_SELECTOR = '.bpx-player-container, .bilibili-player-video-wrap, #bilibili-player, .bilibili-player';
   const VOLUME_WHEEL_SELECTOR = [
     '.bpx-player-ctrl-volume',
@@ -819,6 +822,32 @@
     return false;
   }
 
+  // 普通音量和增强音量都由脚本处理，滚轮与方向键共用同一套逻辑，只是档位不同。
+  // direction：1 = 调大，-1 = 调小；stepPercent 为 100% 以内的每次调整幅度。
+  function adjustPlayerVolume(video, direction, volumeControl, stepPercent = VOLUME_STEP_PERCENT) {
+    const boosting = settings.boostPercent > BOOST_MIN_PERCENT;
+    if (!video.muted && video.volume === 1 && (direction > 0 || boosting)) {
+      // 已到 100%：继续调大进入增强区间，调小则先回到 100%
+      setBoostPercent(direction > 0
+        ? settings.boostPercent * BOOST_STEP_RATIO
+        : settings.boostPercent / BOOST_STEP_RATIO, video);
+    } else {
+      // 静音按 0% 起步；在 0–100% 范围内每次固定增减 stepPercent。
+      // 先清除残留增幅，再修改原生音量，避免恢复声音时突然放大。
+      if (boosting) setBoostPercent(BOOST_MIN_PERCENT, video);
+      const currentPercent = Math.round((video.muted ? 0 : video.volume) * 100);
+      const nextPercent = clamp(currentPercent + direction * stepPercent, 0, 100);
+      video.volume = nextPercent / 100;
+      if (nextPercent > 0) video.muted = false;
+    }
+    if (volumeControl) lastVolumeControl = volumeControl;
+    syncVolumeReadout(volumeControl);
+    // 等播放器处理原生 volumechange 后再次同步数字。
+    scheduleVolumeReadoutSync(volumeControl);
+    // 全区域接管后统一显示提示，普通音量也能看到调整结果。
+    showVolumeOsd(video);
+  }
+
   function handleVolumeWheel(event) {
     // 滚轮调音量默认关闭，未在油猴菜单开启时完全交还浏览器原生滚轮行为
     if (!settings.wheelVolumeEnabled) return;
@@ -836,33 +865,47 @@
     // 非网页全屏/全屏时不拦截事件，交由 B站 原生滚轮调音量逻辑处理
     if (!isImmersivePlayback(video, player)) return;
     const volumeControl = directVolumeControl || (player && player.querySelector(VOLUME_WHEEL_SELECTOR));
-    resetSettingsForNewVideo();
-    lastVolumeControl = volumeControl;
 
-    // 普通音量和增强音量都由脚本处理：部分播放器没有原生滚轮调音量逻辑。
+    resetSettingsForNewVideo();
     event.preventDefault();
     event.stopImmediatePropagation();
-    const scrollingUp = event.deltaY < 0;
-    const boosting = settings.boostPercent > BOOST_MIN_PERCENT;
-    if (!video.muted && video.volume === 1 && (scrollingUp || boosting)) {
-      setBoostPercent(scrollingUp
-        ? settings.boostPercent * BOOST_STEP_RATIO
-        : settings.boostPercent / BOOST_STEP_RATIO, video);
-    } else {
-      // 静音按 0% 起步；在 0–100% 范围内每次增减 5 个百分点。
-      // 先清除残留增幅，再修改原生音量，避免恢复声音时突然放大。
-      if (boosting) setBoostPercent(BOOST_MIN_PERCENT, video);
-      const currentPercent = video.muted ? 0 : video.volume * 100;
-      const nextPercent = clamp(Math.round(currentPercent
-        + (scrollingUp ? VOLUME_WHEEL_STEP_PERCENT : -VOLUME_WHEEL_STEP_PERCENT)), 0, 100);
-      video.volume = nextPercent / 100;
-      if (nextPercent > 0) video.muted = false;
+    adjustPlayerVolume(video, event.deltaY < 0 ? 1 : -1, volumeControl);
+  }
+
+  let lastVolumeKeyAt = 0;
+
+  // 只在网页全屏/全屏下接管上下方向键调音量（每次 5%），普通模式交回 B站 原生逻辑。
+  function handleVolumeKey(event) {
+    if (!settings.wheelVolumeEnabled) return;
+    if (event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
+    const direction = event.code === 'ArrowUp' ? 1 : (event.code === 'ArrowDown' ? -1 : 0);
+    if (!direction) return;
+    const target = event.target instanceof Element ? event.target : null;
+    // 输入框/滑块获得焦点时交还原生按键行为（例如音量条本身的键盘操作）
+    if (target && target.closest('input, textarea, select, [contenteditable=""], [contenteditable="true"]')) return;
+    const video = findBestVideo();
+    if (!video) return;
+    const player = video.closest(PLAYER_SELECTOR);
+    // 非网页全屏/全屏时不拦截按键，交由页面与 B站 原生逻辑处理
+    if (!isImmersivePlayback(video, player)) return;
+
+    const now = performance.now();
+    if (event.repeat) {
+      // 长按时限流，避免自动重复把音量（尤其是 >100% 的增强倍率）瞬间拉飞
+      if (now - lastVolumeKeyAt < VOLUME_KEY_REPEAT_INTERVAL_MS) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        return;
+      }
     }
-    syncVolumeReadout(volumeControl);
-    // 等播放器处理原生 volumechange 后再次同步数字。
-    scheduleVolumeReadoutSync(volumeControl);
-    // 全区域接管后统一显示提示，普通音量也能看到调整结果。
-    showVolumeOsd(video);
+    lastVolumeKeyAt = now;
+
+    resetSettingsForNewVideo();
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    const volumeControl = (player && player.querySelector(VOLUME_WHEEL_SELECTOR))
+      || (lastVolumeControl && lastVolumeControl.isConnected ? lastVolumeControl : null);
+    adjustPlayerVolume(video, direction, volumeControl, VOLUME_KEY_STEP_PERCENT);
   }
 
   function handleVolumeChange(event) {
@@ -1330,21 +1373,6 @@
         transform: translate(-50%, -50%);
       }
       .${PREFIX}-volume-osd svg { width: 30px; height: 30px; flex-shrink: 0; }
-      .${PREFIX}-boost-badge {
-        position: fixed;
-        z-index: 2147483647;
-        display: none;
-        padding: 2px 7px;
-        border-radius: 4px;
-        background: rgba(0, 0, 0, .86);
-        color: #67d2f4;
-        font: 600 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
-        font-variant-numeric: tabular-nums;
-        white-space: nowrap;
-        pointer-events: none;
-        user-select: none;
-        transform: translateX(-50%);
-      }
       @media (max-width: 600px) {
         .${PREFIX}-status-hud { width: min(204px, calc(100vw - 16px)); padding: 6px 8px; font-size: 11px; }
         .${PREFIX}-status-segment { gap: 6px; }
@@ -1448,6 +1476,11 @@
   }
 
   function syncStatusHud() {
+    // 标签页在后台时不可见，跳过这一轮（含 isStatusControlVisible 的强制样式重算），恢复可见后下一轮会自动重建
+    if (document.hidden) {
+      hideStatusHud();
+      return;
+    }
     if (!statusHudEnabled) {
       hideStatusHud();
       return;
@@ -1680,42 +1713,10 @@
     volumeOsdTimer = setTimeout(hideVolumeOsd, 1000);
   }
 
-  let boostBadge = null;
   let lastVolumeControl = null;
-
-  function ensureBoostBadge() {
-    if (!boostBadge || !boostBadge.isConnected) {
-      ensureStyles();
-      boostBadge = document.createElement('div');
-      boostBadge.className = `${PREFIX}-boost-badge`;
-      boostBadge.setAttribute('aria-hidden', 'true');
-    }
-    const host = document.fullscreenElement || document.webkitFullscreenElement
-      || document.body || document.documentElement;
-    if (boostBadge.parentElement !== host) host.appendChild(boostBadge);
-    return boostBadge;
-  }
-
-  // B站音量条只能显示到 100%，增强期间在音量控件上方叠加脚本自己的倍率标签
-  function syncBoostBadge() {
-    const active = settings.boostPercent > BOOST_MIN_PERCENT;
-    const control = active && lastVolumeControl && lastVolumeControl.isConnected
-      ? lastVolumeControl : null;
-    const rect = control ? control.getBoundingClientRect() : null;
-    if (!rect || rect.width < 2 || rect.height < 2) {
-      if (boostBadge) boostBadge.style.display = 'none';
-      return;
-    }
-    const badge = ensureBoostBadge();
-    badge.textContent = `${settings.boostPercent}%`;
-    badge.style.display = 'block';
-    badge.style.left = `${Math.round(rect.left + rect.width / 2)}px`;
-    badge.style.top = `${Math.round(rect.top + 6)}px`;
-  }
 
   function syncBoostReadout() {
     if (panelRefs.boostValue) panelRefs.boostValue.textContent = `${settings.boostPercent}%`;
-    syncBoostBadge();
   }
 
   function syncPanel() {
@@ -2076,7 +2077,7 @@
   function registerWheelVolumeMenu() {
     if (typeof GM_registerMenuCommand !== 'function') return;
 
-    const label = `${wheelVolumeDefaultEnabled ? '☑' : '☐'} 滚轮调音量默认：${wheelVolumeDefaultEnabled ? '开启' : '关闭'}`;
+    const label = `${wheelVolumeDefaultEnabled ? '☑' : '☐'} 滚轮/方向键调音量默认：${wheelVolumeDefaultEnabled ? '开启' : '关闭'}`;
     updateMenuCommand(wheelVolumeMenuIds, 'enabled', label, () => {
       wheelVolumeDefaultEnabled = !wheelVolumeDefaultEnabled;
       DEFAULT_SETTINGS.wheelVolumeEnabled = wheelVolumeDefaultEnabled;
@@ -2086,7 +2087,7 @@
       registerWheelVolumeMenu();
     }, {
       autoClose: false,
-      title: '切换新视频打开时是否默认允许在网页全屏/全屏下用滚轮调节播放器音量（默认开启）',
+      title: '切换新视频打开时是否默认允许在网页全屏/全屏下用滚轮（每次 1%）或上下方向键（每次 5%）调节播放器音量（默认开启）',
     });
   }
 
@@ -2442,10 +2443,7 @@
     registerBoostMenu();
     registerWheelVolumeMenu();
     if (!statusHudTimer) {
-      statusHudTimer = setInterval(() => {
-        syncStatusHud();
-        syncBoostBadge();
-      }, STATUS_HUD_UPDATE_MS);
+      statusHudTimer = setInterval(syncStatusHud, STATUS_HUD_UPDATE_MS);
     }
     document.addEventListener('contextmenu', (event) => {
       if ((panel && panel.contains(event.target))
@@ -2484,6 +2482,8 @@
     document.addEventListener('playing', applyOnPlayback, true);
     // 在播放器的 document/控件监听器之前接管滚轮调音量，避免同一事件被重复处理。
     window.addEventListener('wheel', handleVolumeWheel, { capture: true, passive: false });
+    // 同样在捕获阶段接管网页全屏/全屏下的上下方向键调音量
+    window.addEventListener('keydown', handleVolumeKey, true);
     document.addEventListener('volumechange', handleVolumeChange, true);
     // 面板每次重新展开时 B站会把数字重置为 100，这里补写回当前倍率
     document.addEventListener('mouseover', (event) => {
