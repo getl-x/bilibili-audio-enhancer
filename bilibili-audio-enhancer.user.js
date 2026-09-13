@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站清澈人声-音量增强-动态音量平衡
 // @namespace    https://www.bilibili.com/
-// @version      1.15.7
+// @version      1.15.8
 // @description  为B站视频页与直播间播放器加入音频增强、自然响应动态响度平衡及播放器内实时状态条；网页全屏/全屏下由脚本接管滚轮（每次 1%）与上下方向键（每次 5%）调音量，普通模式沿用B站原生逻辑
 // @license      MIT
 // @match        *://bilibili.com/*
@@ -50,16 +50,25 @@
   ].join(',');
   // 直播间播放器根（模式类标在它身上）
   const LIVE_PLAYER_CONTAINER_SELECTOR = '#live-player-ctnr, .live-player-ctnr';
-  // 直播间控制栏的候选容器：SDK 版本不同挂载位置会变，逐个试，最后退回整个播放器范围搜索
-  const LIVE_BAR_CANDIDATE_SELECTORS = [
-    '#web-player__bottom-bar__container',
-    '.web-player-controller-bg',
-    '#web-player-controller-wrap-el',
-  ];
-  // 直播间按钮自身的尺寸与间距（位置取自锚点，这两个值只决定我们自己的框）
-  const LIVE_TOOLBAR_SIZE_PX = 34;
-  const LIVE_TOOLBAR_GAP_PX = 6;
-  // 直播间的模式类：normal=普通模式，其余（web-full / fullscreen 等）按沉浸处理
+  // 直播间控制栏（实测结构，Room Player / Svelte 版，2026-09 实测）：
+  //   #web-player-controller-wrap-el                       ← 稳定挂载点，未 hover 时为空（0 子节点）
+  //     └ .live-web-player-controller > .control-area      ← 鼠标进入播放器底部时挂载，离开约 4s 后整棵卸载
+  //         ├ .left-area  [播放/暂停, 刷新, .volume(音量), 开播时长]
+  //         └ .right-area [全屏模式, 网页模式, .danmaku(弹幕设置), 关闭弹幕, 小窗模式, .quality-wrap(清晰度), .ext-nodes]
+  // 注意：.right-area 是 row-reverse（DOM 顺序 = 视觉从右往左），.ext-nodes 是官方预留的空扩展位。
+  // 类名带 svelte-xxxx 编译哈希（版本升级即变），因此只用不带哈希的语义类定位。
+  const LIVE_BAR_WRAP_SELECTOR = '#web-player-controller-wrap-el';
+  const LIVE_BAR_AREA_SELECTOR = '.control-area';
+  const LIVE_BAR_EXT_NODES_SELECTOR = '.right-area .ext-nodes, .ext-nodes';
+  const LIVE_BAR_LEFT_AREA_SELECTOR = '.left-area';
+  // 直播间按钮尺寸与间距：对齐原生控件（实测原生按钮 30×30、间距 4px、图标 24×24，.control-area 高 36）
+  const LIVE_TOOLBAR_SIZE_PX = 30;
+  const LIVE_TOOLBAR_GAP_PX = 4;
+  // 直播间的模式类：normal=普通模式，其余（web-full / fullscreen 等）按沉浸处理。
+  // 实测（Room Player，2026-09）：直播间的两个按钮叫「网页模式」「全屏模式」（不是视频页的网页全屏/全屏），
+  // 进入后 #live-player-ctnr 的类名**完全不变**（MutationObserver 全程无改动，仍是 …normal），
+  // 真正的信号是播放器对 #fullscreen-container 请求了元素全屏（document.fullscreenElement 非空），
+  // 因此沉浸判定实际由 isImmersivePlayback 的第一条全屏检查命中；这两个常量保留作兜底。
   const LIVE_NORMAL_CLASS = 'normal';
   const LIVE_IMMERSIVE_CLASS_PATTERN = /webfull|web-full|screen-full|fullscreen|^full$|^web$/i;
   const VOLUME_WHEEL_SELECTOR = [
@@ -71,6 +80,10 @@
     '[class*="ctrl-volume"]',
     '[class*="volume-panel"]',
     '[class*="volume-slider"]',
+    // 直播间（Svelte 版控制栏）：音量控件是 div.volume，弹出面板是 div.volume-control，
+    // 内部没有 input[type=range]，只有 .slider-rail / .slider-handle（读数在 .number 里）。
+    '.volume',
+    '.volume-control',
   ].join(',');
   let defaultNormalizerEnabled = loadNormalizerDefault();
   let defaultLoudnessPreset = loadDefaultLoudnessPreset();
@@ -207,9 +220,10 @@
   let normalizerCloseTimer = null;
   let toolbarScanScheduled = false;
   let toolbarFullScanAt = 0;
+  // 空扫描退避：连续「什么都没找到」时逐步拉长全量扫描间隔（直播间控制栏 hover 才挂载，空扫描是常态）
+  let toolbarEmptyScanBackoffMs = 0;
+  let toolbarLastEmptyScanAt = 0;
   const toolbarParents = new Set();
-  // 直播间：脚本按钮集合（找不到锚点时要整体隐藏，避免定位未成功时飘在角落）
-  const liveToolbarButtons = new Set();
   const normalizerDefaultMenuIds = new Map();
   const normalizerSpeedMenuIds = new Map();
   const statusHudMenuIds = new Map();
@@ -828,14 +842,18 @@
     if (document.fullscreenElement || document.webkitFullscreenElement
       || document.mozFullScreenElement || document.msFullscreenElement) return true;
 
-    // 直播间：播放器根是 #live-player-ctnr，模式类标在它身上（normal=普通，其余按沉浸处理）
+    // 直播间：播放器根是 #live-player-ctnr（「网页模式」「全屏模式」都不改它的类名，实测走元素全屏）
     const liveContainer = (video && video.closest && video.closest(LIVE_PLAYER_CONTAINER_SELECTOR))
       || (player && player.closest && player.closest(LIVE_PLAYER_CONTAINER_SELECTOR))
       || null;
     if (liveContainer) {
       const liveClassNames = String(liveContainer.className || '').split(/\s+/).filter(Boolean);
       if (liveClassNames.some((name) => LIVE_IMMERSIVE_CLASS_PATTERN.test(name))) return true;
-      // 明确标了普通模式就不再往下猜（直播间的类名体系与 bpx 不同，兜底正则容易误判）
+      // 明确标了普通模式就不再往下猜（直播间的类名体系与 bpx 不同，兜底正则容易误判）。
+      // 注意：直播间进「网页模式」时这里仍是 normal（类名不变，实测），但那种情况上面第一条全屏检查
+      // 已经命中（播放器对 #fullscreen-container 请求了元素全屏），所以不会被这里拦掉；
+      // 反过来也不能把「播放器铺满视口」的兜底挪到这条之前：普通模式下窗口又窄又矮时会误判，
+      // 会抢走 B站 原生滚轮/方向键行为。
       if (liveClassNames.includes(LIVE_NORMAL_CLASS)) return false;
     }
 
@@ -1285,31 +1303,48 @@
         background: #00aeec;
         box-shadow: 0 0 0 1px rgba(0, 0, 0, .45);
       }
-      /* 直播间：按钮插在原生控件旁边（控制栏子节点，随控制栏一起显隐），
-         位置由脚本按锚点的 offsetLeft/offsetTop/offsetHeight 给出 —— 同排、紧贴其右侧。
-         fx-placed 之前不显示，避免定位还没成功时「飘在角落」。 */
-      .${PREFIX}-live-toolbar {
-        position: absolute;
-        z-index: 14;
-        display: none;
+      /* 直播间：按钮插进控制栏自己的布局里 —— .left-area 内「音量按钮之后、开播时长之前」，
+         作为控制栏的普通 flex 子项参与排版：既不绝对定位、也不测量坐标，因此不会压住原生控件，
+         也不会随窗口尺寸/全屏切换失位。控制栏是 hover 才挂载、离开即卸载的（Svelte 版实测行为），
+         按钮随控制栏一起出现/消失。 */
+      .${PREFIX}-live-toolbar-group {
+        display: flex;
+        align-items: center;
+        gap: ${LIVE_TOOLBAR_GAP_PX}px;
+        margin-left: ${LIVE_TOOLBAR_GAP_PX}px;
+        height: 100%;
+      }
+      /* 注意：上面 .${PREFIX}-toolbar:not(...):not(...) 那条通用规则（36×22）权重比单类高，
+         所以这里要带上同样的 :not() 链把权重顶到同级；display 两边都是 !important，靠源码顺序取胜。 */
+      .${PREFIX}-live-toolbar:not(.bpx-player-ctrl-btn):not(.bilibili-player-video-btn) {
+        display: flex !important;
         align-items: center;
         justify-content: center;
-        width: 34px;
-        height: 32px;
+        width: ${LIVE_TOOLBAR_SIZE_PX}px;
+        height: ${LIVE_TOOLBAR_SIZE_PX}px;
+        line-height: ${LIVE_TOOLBAR_SIZE_PX}px;
+        border-radius: 4px;
         color: rgba(255, 255, 255, .9);
+        cursor: pointer;
       }
-      .${PREFIX}-live-toolbar.fx-placed {
-        display: flex !important;
+      .${PREFIX}-live-toolbar:hover,
+      .${PREFIX}-live-toolbar.fx-panel-open {
+        background: rgba(255, 255, 255, .12);
+      }
+      .${PREFIX}-live-toolbar:focus-visible {
+        outline: 2px solid #00aeec;
+        outline-offset: -2px;
       }
       .${PREFIX}-live-toolbar-icon {
+        position: relative;
         display: flex;
         align-items: center;
         justify-content: center;
-        width: 22px;
-        height: 22px;
+        width: 24px;
+        height: 24px;
       }
-      .${PREFIX}-live-toolbar-svg { display: block; width: 100%; height: 100%; }
-      .${PREFIX}-live-toolbar-svg > .${PREFIX}-toolbar-icon { height: 100%; }
+      .${PREFIX}-live-toolbar-svg { position: relative; display: block; width: 100%; height: 100%; }
+      .${PREFIX}-live-toolbar-svg > .${PREFIX}-toolbar-icon { width: 100%; height: 100%; }
       .${PREFIX}-toolbar.fx-feature-enabled .${PREFIX}-live-toolbar-svg::after {
         content: "";
         position: absolute;
@@ -2291,71 +2326,89 @@
     return true;
   }
 
-  // 直播间：控制栏内部全是编译后的哈希类名，认不出「音量按钮」，没法照视频页那样按类名定位。
-  // 但思路可以照搬：找出控制栏里最靠右的原生控件当锚点，把脚本按钮作为兄弟节点插在它左边，
-  // 位置和间距完全交给控制栏自己的布局，不做绝对定位、也不测坐标，因此不会压住原生控件。
-  function findLiveToolbarAnchor(player) {
-    const playerRect = player.getBoundingClientRect();
-    if (playerRect.width < 60 || playerRect.height < 60) return null;
-    // 先在小范围的候选容器里找（SDK 版本不同，控制栏挂在哪一层会变），都找不到再退回整个播放器
-    for (const selector of LIVE_BAR_CANDIDATE_SELECTORS) {
-      const host = player.querySelector(selector) || document.querySelector(selector);
-      if (!host) continue;
-      const anchor = pickRightmostLiveControl(host, playerRect);
-      if (anchor) return anchor;
+  // 直播间控制栏是 Svelte 产物：类名带编译哈希（svelte-xxxx，版本升级即变），且只在鼠标进入播放器
+  // 底部时挂载、鼠标离开约 4s 后整棵卸载。所以不去猜「哪个元素是音量按钮」，直接按不带哈希的语义类
+  // 现场查控制栏容器；挂载了才插，卸载了按钮随控制栏一起消失。
+  // 只用 id 定位（getElementById 比选择器扫描便宜），不做全文档兜底：实测控制栏一定在
+  // #live-player / #live-player-ctnr 之内，全文档兜底会让 MutationObserver 的快速通道变贵。
+  function findLiveBarHost() {
+    for (const root of [
+      document.getElementById('live-player'),
+      document.getElementById('live-player-ctnr'),
+    ]) {
+      if (!root) continue;
+      const host = root.querySelector(LIVE_BAR_AREA_SELECTOR);
+      if (host) return host;
     }
-    return pickRightmostLiveControl(player, playerRect, 4000);
+    return null;
   }
 
-  // 什么算「原生控件」：在播放器底部那一带、尺寸像按钮、不是整层容器的可见元素
-  function isLiveControlCandidate(node, playerRect) {
-    if (node.closest(`[data-${PREFIX}-toolbar="1"]`)
-      || node.closest(`[data-${PREFIX}-normalizer-toolbar="1"]`)) return false;
-    const rect = node.getBoundingClientRect();
-    if (rect.width < 16 || rect.height < 16) return false;
-    // 排除整层容器（画面、弹幕层、控制栏背景层等）
-    if (rect.height > playerRect.height * 0.3 || rect.width > playerRect.width * 0.5) return false;
-    // 只认播放器底部这一带（控制栏所在区域）
-    if (rect.top < playerRect.bottom - playerRect.height * 0.25) return false;
-    if (rect.left < playerRect.left - 1 || rect.right > playerRect.right + 1) return false;
+  // 控制栏是否已挂载且按钮已就位：给 MutationObserver 的快速通道做「要不要动手」的判断，尽量便宜
+  function liveToolbarReady() {
+    const wrap = document.querySelector(LIVE_BAR_WRAP_SELECTOR);
+    if (!wrap || !wrap.firstElementChild) return false;
+    return Boolean(wrap.querySelector(`[data-${PREFIX}-live-group="1"]`));
+  }
+
+  // 直播间按钮的插入本体：挂载后立刻就要插好，否则控制栏会先画出「没有按钮」的布局、
+  // 下一帧再把开播时长挤开一次，看起来就是「控制栏弹出来时抖一下」。
+  // 因此这个函数既被全量扫描调用，也被 install() 里 MutationObserver 的快速通道同步调用。
+  function ensureLiveToolbarButtons() {
+    const host = findLiveBarHost();
+    if (!host) return false;
+    const group = ensureLiveToolbarGroup(findLiveToolbarSlot(host));
+    toolbarParents.add(group);
+    const { enhancerButton, normalizerButton } =
+      ensureToolbarPair(group, group, [], true);
+    if (enhancerButton.nextElementSibling !== normalizerButton
+      || normalizerButton !== group.lastElementChild) {
+      group.appendChild(enhancerButton);
+      group.appendChild(normalizerButton);
+    }
     return true;
   }
 
-  function pickRightmostLiveControl(root, playerRect, limit) {
-    let best = null;
-    let seen = 0;
-    for (const node of root.querySelectorAll('*')) {
-      if (limit && ++seen > limit) break;
-      if (!isLiveControlCandidate(node, playerRect)) continue;
-      const rect = node.getBoundingClientRect();
-      if (!best || rect.right > best.right) best = { node, right: rect.right };
+  // 插入位置：插在 .left-area 里「音量按钮之后、开播时长之前」（左右各留一个原生间距）。
+  // 实测 .left-area 的结构是 [播放/暂停, 刷新, div.volume(音量), div.tip-wrap(开播时长)]，
+  // 所以锚点取音量控件的下一个兄弟（即时长），把分组插在它前面；时长会因此整体右移我们这组按钮的宽度。
+  // 兜底：音量控件找不到时退回官方预留的空扩展位 .ext-nodes（在 .right-area 内），再兜底直接挂在控制栏里。
+  // anchor 为 null 表示追加到父节点末尾。
+  function findLiveToolbarSlot(host) {
+    const leftArea = host.querySelector(LIVE_BAR_LEFT_AREA_SELECTOR);
+    if (leftArea) {
+      const volume = leftArea.querySelector('.volume, [class*="volume"]');
+      return { parent: leftArea, anchor: volume ? volume.nextElementSibling : null };
     }
-    return best ? best.node : null;
+    const extNodes = host.querySelector(LIVE_BAR_EXT_NODES_SELECTOR);
+    if (extNodes) return { parent: extNodes, anchor: null };
+    return { parent: host, anchor: null };
   }
 
-  // 直播间：把按钮摆到锚点同一行、紧贴它右侧。
-  // 几何用锚点自己的 offsetLeft / offsetTop / offsetHeight（与锚点同一个 offsetParent 坐标系），
-  // 因此不管控制栏内部是 flex 流式还是各控件绝对定位，都能落在同一行；
-  // 摆好之前按钮不显示（fx-placed），避免出现「飘在角落」的中间状态。
-  function layoutLiveToolbarNextTo(anchor, buttons) {
-    if (!anchor || !anchor.isConnected) return false;
-    const width = LIVE_TOOLBAR_SIZE_PX;
-    const step = width + LIVE_TOOLBAR_GAP_PX;
-    const left = anchor.offsetLeft + anchor.offsetWidth + LIVE_TOOLBAR_GAP_PX;
-    const top = anchor.offsetTop;
-    const height = anchor.offsetHeight;
-    buttons.forEach((button, index) => {
-      button.style.left = `${Math.round(left + index * step)}px`;
-      button.style.top = `${Math.round(top)}px`;
-      button.style.width = `${width}px`;
-      button.style.height = `${Math.round(height)}px`;
-      button.classList.add('fx-placed');
-    });
-    return true;
-  }
-
-  function hideLiveToolbar(buttons) {
-    for (const button of buttons) button.classList.remove('fx-placed');
+  // 两个按钮先放进脚本自己的分组容器，再把这一个分组作为控制栏的单个 flex 子项插入：
+  // 这样按钮之间的间距完全由脚本决定，不受控制栏内部 gap/margin 影响，插入位置也不需要改两次。
+  function ensureLiveToolbarGroup(slot) {
+    const { parent, anchor } = slot;
+    let group = null;
+    for (const child of parent.children) {
+      if (child.classList && child.classList.contains(`${PREFIX}-live-toolbar-group`)) {
+        group = child;
+        break;
+      }
+    }
+    if (!group) {
+      group = document.createElement('div');
+      group.className = `${PREFIX}-live-toolbar-group`;
+      group.setAttribute(`data-${PREFIX}-live-group`, '1');
+    }
+    // 插入位置变更（或脚本热更新）时，别把上一份分组留在原容器里，否则会同时出现两套按钮
+    for (const stray of document.querySelectorAll(`[data-${PREFIX}-live-group="1"]`)) {
+      if (stray !== group && stray.parentElement !== parent) stray.remove();
+    }
+    if (group.parentElement !== parent) {
+      if (anchor) parent.insertBefore(group, anchor);
+      else parent.appendChild(group);
+    }
+    return group;
   }
 
   // 在同一父节点内保证「音频增强」「动态音量」两个按钮存在（视频页与直播间共用），返回这两个按钮
@@ -2413,6 +2466,9 @@
     const scanAt = performance.now();
     // 按钮仍在原位时跳过全量扫描，最多每 2 秒兜底扫描一次
     if (toolbarButtonsIntact() && scanAt - toolbarFullScanAt < 2000) return;
+    // 上一次空扫描的退避没到点就跳过。控制栏挂载由 MutationObserver 的快速通道同步处理，不会因此变慢；
+    // 这里退避掉的是「直播间控制栏没挂载（常态）」时的空扫描，避免页面每 100ms 一次 mutation 就全文档扫一遍。
+    if (toolbarEmptyScanBackoffMs && scanAt - toolbarLastEmptyScanAt < toolbarEmptyScanBackoffMs) return;
     toolbarFullScanAt = scanAt;
     ensureStyles();
     toolbarParents.clear();
@@ -2441,38 +2497,20 @@
       }
     }
 
-    // 直播间：控制栏内部是编译后的哈希类名，认不出「音量按钮」，而且它挂在哪一层随 SDK 版本变化。
-    // 做法：① 在整个播放器底部那一带按「位置 + 尺寸」找出最靠右的原生控件当锚点；
-    //       ② 把两个按钮作为兄弟节点插到它右边（结构上属于控制栏，随控制栏一起显隐）；
-    //       ③ 用锚点自己的 offsetLeft / offsetTop / offsetHeight 定位 —— 同排、紧贴其右侧。
-    // 定位成功之前按钮不显示，避免出现「飘在角落」的中间状态。
-    const livePlayer = document.querySelector(LIVE_PLAYER_CONTAINER_SELECTOR)
-      || document.querySelector('#live-player')
-      || null;
-    if (livePlayer) {
-      const anchor = findLiveToolbarAnchor(livePlayer);
-      if (anchor && anchor.parentElement) {
-        const parent = anchor.parentElement;
-        toolbarParents.add(parent);
-        const { enhancerButton, normalizerButton } =
-          ensureToolbarPair(parent, anchor, [], true);
-        const buttons = [enhancerButton, normalizerButton];
-        if (enhancerButton.previousElementSibling !== anchor
-          || normalizerButton.previousElementSibling !== enhancerButton) {
-          // 参照节点只取一次：第一次插入后 anchor.nextElementSibling 就变了
-          const after = anchor.nextElementSibling;
-          parent.insertBefore(enhancerButton, after);
-          parent.insertBefore(normalizerButton, after);
-        }
-        for (const button of buttons) liveToolbarButtons.add(button);
-        for (const button of [...liveToolbarButtons]) {
-          if (!button.isConnected) liveToolbarButtons.delete(button);
-        }
-        layoutLiveToolbarNextTo(anchor, buttons);
-      } else {
-        // 控制栏隐藏中/还没渲染出原生控件：隐藏按钮，等下一次扫描拿到锚点再摆位
-        hideLiveToolbar(liveToolbarButtons);
-      }
+    // 直播间：控制栏是 Svelte 产物（哈希类名），且只在 hover 时挂载、鼠标离开约 4s 后整棵卸载。
+    // 挂载那一刻由 install() 里 MutationObserver 的快速通道同步插入（避免「控制栏先画出来、
+    // 下一帧再把开播时长挤开一次」的抖动）；这里只作兜底，例如脚本注入得比控制栏晚的情况。
+    const liveFound = ensureLiveToolbarButtons();
+
+    // 空扫描退避：既没插上按钮、页面上也没有可插的音量控件，说明还没有插入目标。
+    // 连续空扫描按 150ms → 300ms → … → 1s 逐步拉长；一旦插上了立刻恢复全速。
+    if (liveFound || volumeControls.size > 0) {
+      toolbarEmptyScanBackoffMs = 0;
+      toolbarLastEmptyScanAt = 0;
+    } else {
+      toolbarLastEmptyScanAt = scanAt;
+      toolbarEmptyScanBackoffMs = Math.min(1000,
+        toolbarEmptyScanBackoffMs ? toolbarEmptyScanBackoffMs * 2 : 150);
     }
 
     syncToolbarButtons();
@@ -2730,6 +2768,17 @@
       if (Date.now() <= injectUntil) injectVisibleMenus();
     };
     const observer = new MutationObserver((mutations) => {
+      // 直播间控制栏是「hover 才挂载、离开即卸载」的，而挂载就是往 #web-player-controller-wrap-el 里插
+      // 子节点（Svelte 在文档外拼好再整体插入）。必须在这一轮 microtask 内把按钮插好，否则控制栏会先按
+      // 「没有按钮」的布局画一帧，下一帧再把开播时长挤开一次 —— 用户看到的就是「控制栏弹出来时抖一下」。
+      // 只认 wrap 自己的子节点变更，判断成本几乎为零，也不会触发全量扫描。
+      for (const mutation of mutations) {
+        const target = mutation.target;
+        if (target instanceof Element && target.id === 'web-player-controller-wrap-el') {
+          if (!liveToolbarReady()) ensureLiveToolbarButtons();
+          break;
+        }
+      }
       // 已经安排了延迟扫描时直接返回，避免对整批 mutation 逐条 closest
       if (pendingMutationScanTimer) return;
       const hasExternalMutation = mutations.some((mutation) => {
