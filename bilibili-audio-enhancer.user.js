@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         B站清澈人声-音量增强-动态音量平衡
 // @namespace    https://www.bilibili.com/
-// @version      1.14.0
-// @description  为B站播放器加入音频增强、自然响应动态响度平衡及播放器内实时状态条；网页全屏/全屏下由脚本接管滚轮（每次 1%）与上下方向键（每次 5%）调音量，普通模式沿用B站原生逻辑
+// @version      1.15.0
+// @description  为B站视频页与直播间播放器加入音频增强、自然响应动态响度平衡及播放器内实时状态条；网页全屏/全屏下由脚本接管滚轮（每次 1%）与上下方向键（每次 5%）调音量，普通模式沿用B站原生逻辑
 // @license      MIT
 // @match        *://bilibili.com/*
 // @match        *://*.bilibili.com/*
@@ -37,7 +37,23 @@
   const VOLUME_STEP_PERCENT = 1;
   const VOLUME_KEY_STEP_PERCENT = 5;
   const VOLUME_KEY_REPEAT_INTERVAL_MS = 90;
-  const PLAYER_SELECTOR = '.bpx-player-container, .bilibili-player-video-wrap, #bilibili-player, .bilibili-player';
+  // 视频页（bpx 播放器）与直播间（#live-player-ctnr / #live-player）的播放器根
+  const PLAYER_SELECTOR = [
+    '.bpx-player-container',
+    '.bilibili-player-video-wrap',
+    '#bilibili-player',
+    '.bilibili-player',
+    '#live-player-ctnr',
+    '.live-player-ctnr',
+    '#live-player',
+    '.live-player-mounter',
+  ].join(',');
+  // 直播间播放器根（模式类标在它身上）与控制栏宿主（播放器 SDK 运行时创建，id 稳定）
+  const LIVE_PLAYER_CONTAINER_SELECTOR = '#live-player-ctnr, .live-player-ctnr';
+  const LIVE_CONTROL_BAR_ID = 'web-player-controller-wrap-el';
+  // 直播间的模式类：normal=普通模式，其余（web-full / fullscreen 等）按沉浸处理
+  const LIVE_NORMAL_CLASS = 'normal';
+  const LIVE_IMMERSIVE_CLASS_PATTERN = /webfull|web-full|screen-full|fullscreen|^full$|^web$/i;
   const VOLUME_WHEEL_SELECTOR = [
     '.bpx-player-ctrl-volume',
     '.bpx-player-rich-pip-volume',
@@ -755,7 +771,7 @@
     }
     // 兜底：B站改类名时，只要在播放器内且类名含 volume 也算音量控件
     const generic = target.closest('[class*="volume"]');
-    if (generic && generic.closest('.bpx-player-container, #bilibili-player, .bilibili-player')) {
+    if (generic && generic.closest(PLAYER_SELECTOR)) {
       return generic;
     }
     return null;
@@ -797,10 +813,21 @@
   }
 
   // 仅在「网页全屏 / 全屏」下由脚本接管滚轮；普通、宽屏、小窗等模式交回 B站 原生滚轮逻辑。
-  // 依次判断：原生全屏 API → B站播放器 data-screen 属性 → 类名兜底 → 播放器是否铺满视口。
+  // 依次判断：原生全屏 API → 直播间模式类 → B站播放器 data-screen 属性 → 类名兜底 → 播放器是否铺满视口。
   function isImmersivePlayback(video, player) {
     if (document.fullscreenElement || document.webkitFullscreenElement
       || document.mozFullScreenElement || document.msFullscreenElement) return true;
+
+    // 直播间：播放器根是 #live-player-ctnr，模式类标在它身上（normal=普通，其余按沉浸处理）
+    const liveContainer = (video && video.closest && video.closest(LIVE_PLAYER_CONTAINER_SELECTOR))
+      || (player && player.closest && player.closest(LIVE_PLAYER_CONTAINER_SELECTOR))
+      || null;
+    if (liveContainer) {
+      const liveClassNames = String(liveContainer.className || '').split(/\s+/).filter(Boolean);
+      if (liveClassNames.some((name) => LIVE_IMMERSIVE_CLASS_PATTERN.test(name))) return true;
+      // 明确标了普通模式就不再往下猜（直播间的类名体系与 bpx 不同，兜底正则容易误判）
+      if (liveClassNames.includes(LIVE_NORMAL_CLASS)) return false;
+    }
 
     const container = (player && player.closest && player.closest('.bpx-player-container'))
       || (video && video.closest && video.closest('.bpx-player-container'))
@@ -1248,6 +1275,40 @@
         background: #00aeec;
         box-shadow: 0 0 0 1px rgba(0, 0, 0, .45);
       }
+      /* 直播间：控制栏宿主 (#web-player-controller-wrap-el) 高度由内部内容决定，用底边定位更稳 */
+      .${PREFIX}-live-toolbar {
+        position: absolute;
+        bottom: 14px;
+        z-index: 14;
+        display: flex !important;
+        align-items: center;
+        justify-content: center;
+        width: 36px;
+        height: 32px;
+        color: rgba(255, 255, 255, .9);
+      }
+      .${PREFIX}-live-toolbar[data-${PREFIX}-toolbar="1"] { left: 8px; }
+      .${PREFIX}-live-toolbar[data-${PREFIX}-normalizer-toolbar="1"] { left: 48px; }
+      .${PREFIX}-live-toolbar-icon {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 22px;
+        height: 22px;
+      }
+      .${PREFIX}-live-toolbar-svg { display: block; width: 100%; height: 100%; }
+      .${PREFIX}-live-toolbar-svg > .${PREFIX}-toolbar-icon { height: 100%; }
+      .${PREFIX}-toolbar.fx-feature-enabled .${PREFIX}-live-toolbar-svg::after {
+        content: "";
+        position: absolute;
+        right: 0;
+        bottom: 1px;
+        width: 3px;
+        height: 3px;
+        border-radius: 50%;
+        background: #00aeec;
+        box-shadow: 0 0 0 1px rgba(0, 0, 0, .45);
+      }
       .${PREFIX}-status-hud {
         position: fixed;
         left: 0;
@@ -1440,7 +1501,7 @@
 
   function isStatusControlVisible(video) {
     if (!video) return false;
-    const player = video.closest('.bpx-player-container, .bilibili-player-video-wrap, #bilibili-player');
+    const player = video.closest(PLAYER_SELECTOR);
     const root = player || document;
     const selector = [
       `[data-${PREFIX}-toolbar="1"]`,
@@ -2159,10 +2220,11 @@
     }
   }
 
-  function createNativeToolbarControl(insertionTarget, nativeClasses, dataName, label, svgMarkup, onActivate) {
+  function createNativeToolbarControl(insertionTarget, nativeClasses, dataName, label, svgMarkup, onActivate, liveMode = false) {
     const control = insertionTarget.cloneNode(false);
     for (const attribute of [...control.attributes]) control.removeAttribute(attribute.name);
-    control.className = [...nativeClasses, `${PREFIX}-toolbar`].join(' ');
+    control.className = [...nativeClasses, `${PREFIX}-toolbar`,
+      liveMode ? `${PREFIX}-live-toolbar` : ''].filter(Boolean).join(' ');
     control.setAttribute(dataName, '1');
     control.setAttribute('aria-label', label);
     control.setAttribute('aria-haspopup', 'dialog');
@@ -2173,15 +2235,17 @@
       control.tabIndex = 0;
     }
 
-    const nativeIcon = insertionTarget.querySelector(':scope > .bpx-player-ctrl-btn-icon')
-      || insertionTarget.querySelector('.bpx-player-ctrl-btn-icon');
+    // 直播间控制栏是 Svelte 产物（哈希类名、无 bpx 图标节点），直接用脚本自己的图标容器
+    const nativeIcon = liveMode ? null
+      : (insertionTarget.querySelector(':scope > .bpx-player-ctrl-btn-icon')
+        || insertionTarget.querySelector('.bpx-player-ctrl-btn-icon'));
     const nativeCommonIcon = nativeIcon && nativeIcon.querySelector('.bpx-common-svg-icon');
     const iconShell = nativeIcon ? nativeIcon.cloneNode(false) : document.createElement('span');
     const commonIcon = nativeCommonIcon ? nativeCommonIcon.cloneNode(false) : document.createElement('span');
     clearDuplicateIds(iconShell);
     clearDuplicateIds(commonIcon);
-    iconShell.className = 'bpx-player-ctrl-btn-icon';
-    commonIcon.className = 'bpx-common-svg-icon';
+    iconShell.className = liveMode ? `${PREFIX}-live-toolbar-icon` : 'bpx-player-ctrl-btn-icon';
+    commonIcon.className = liveMode ? `${PREFIX}-live-toolbar-svg` : 'bpx-common-svg-icon';
     commonIcon.innerHTML = svgMarkup;
     iconShell.appendChild(commonIcon);
     control.appendChild(iconShell);
@@ -2215,6 +2279,57 @@
     return true;
   }
 
+  // 在同一父节点内保证「音频增强」「动态音量」两个按钮存在（视频页与直播间共用），返回这两个按钮
+  function ensureToolbarPair(parent, insertionTarget, nativeClasses, liveMode) {
+    let normalizerButton = parent.querySelector(`:scope > [data-${PREFIX}-normalizer-toolbar="1"]`);
+    if (!normalizerButton) {
+      normalizerButton = createNativeToolbarControl(
+        insertionTarget,
+        nativeClasses,
+        `data-${PREFIX}-normalizer-toolbar`,
+        '动态音量',
+        `<svg class="${PREFIX}-toolbar-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+          stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M3 12h4l3-8 4 16 3-8h4"/>
+        </svg>`,
+        (control) => {
+          if (normalizerPanel && normalizerPanel.style.display !== 'none'
+            && normalizerPanel.classList.contains('fx-open')) {
+            closeNormalizerPanel();
+            return;
+          }
+          showNormalizerPanel(findVideoForControl(control));
+        },
+        liveMode,
+      );
+    }
+
+    let enhancerButton = parent.querySelector(`:scope > [data-${PREFIX}-toolbar="1"]`);
+    if (!enhancerButton) {
+      enhancerButton = createNativeToolbarControl(
+        insertionTarget,
+        nativeClasses,
+        `data-${PREFIX}-toolbar`,
+        '音频增强',
+        `<svg class="${PREFIX}-toolbar-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+          stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M4 6h7M15 6h5M4 12h3M11 12h9M4 18h9M17 18h3"/>
+          <path d="M11 4v4M7 10v4M17 16v4"/>
+        </svg>`,
+        (control) => {
+          if (panel && panel.style.display !== 'none' && panel.classList.contains('fx-open')) {
+            closePanel();
+            return;
+          }
+          showPanel(findVideoForControl(control));
+        },
+        liveMode,
+      );
+    }
+
+    return { enhancerButton, normalizerButton };
+  }
+
   function ensureToolbarButtons() {
     const scanAt = performance.now();
     // 按钮仍在原位时跳过全量扫描，最多每 2 秒兜底扫描一次
@@ -2237,49 +2352,8 @@
       const nativeClasses = [...insertionTarget.classList]
         .filter((name) => name === 'bpx-player-ctrl-btn' || name === 'bilibili-player-video-btn');
 
-      let normalizerButton = parent.querySelector(`:scope > [data-${PREFIX}-normalizer-toolbar="1"]`);
-      if (!normalizerButton) {
-        normalizerButton = createNativeToolbarControl(
-          insertionTarget,
-          nativeClasses,
-          `data-${PREFIX}-normalizer-toolbar`,
-          '动态音量',
-          `<svg class="${PREFIX}-toolbar-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-            stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M3 12h4l3-8 4 16 3-8h4"/>
-          </svg>`,
-          (control) => {
-            if (normalizerPanel && normalizerPanel.style.display !== 'none'
-              && normalizerPanel.classList.contains('fx-open')) {
-              closeNormalizerPanel();
-              return;
-            }
-            showNormalizerPanel(findVideoForControl(control));
-          },
-        );
-      }
-
-      let enhancerButton = parent.querySelector(`:scope > [data-${PREFIX}-toolbar="1"]`);
-      if (!enhancerButton) {
-        enhancerButton = createNativeToolbarControl(
-          insertionTarget,
-          nativeClasses,
-          `data-${PREFIX}-toolbar`,
-          '音频增强',
-          `<svg class="${PREFIX}-toolbar-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-            stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M4 6h7M15 6h5M4 12h3M11 12h9M4 18h9M17 18h3"/>
-            <path d="M11 4v4M7 10v4M17 16v4"/>
-          </svg>`,
-          (control) => {
-            if (panel && panel.style.display !== 'none' && panel.classList.contains('fx-open')) {
-              closePanel();
-              return;
-            }
-            showPanel(findVideoForControl(control));
-          },
-        );
-      }
+      const { enhancerButton, normalizerButton } =
+        ensureToolbarPair(parent, insertionTarget, nativeClasses, false);
 
       if (enhancerButton.nextElementSibling !== normalizerButton
         || normalizerButton.nextElementSibling !== insertionTarget) {
@@ -2287,6 +2361,21 @@
         parent.insertBefore(normalizerButton, insertionTarget);
       }
     }
+
+    // 直播间：控制栏是播放器 SDK 运行时创建的 Svelte 节点，内部类名带哈希、没有 bpx 图标节点，
+    // 所以不猜「音量按钮」，直接把两个按钮插到稳定宿主 #web-player-controller-wrap-el 的最前面（控制栏左端）。
+    // 控制栏显隐是在宿主自身上切 visibility，子节点会跟着一起显隐。
+    const liveBar = document.getElementById(LIVE_CONTROL_BAR_ID);
+    if (liveBar) {
+      toolbarParents.add(liveBar);
+      const { enhancerButton, normalizerButton } = ensureToolbarPair(liveBar, liveBar, [], true);
+      if (liveBar.firstElementChild !== enhancerButton
+        || enhancerButton.nextElementSibling !== normalizerButton) {
+        liveBar.insertBefore(normalizerButton, liveBar.firstChild);
+        liveBar.insertBefore(enhancerButton, liveBar.firstChild);
+      }
+    }
+
     syncToolbarButtons();
   }
 
