@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站清澈人声-音量增强-动态音量平衡
 // @namespace    https://www.bilibili.com/
-// @version      1.15.6
+// @version      1.15.7
 // @description  为B站视频页与直播间播放器加入音频增强、自然响应动态响度平衡及播放器内实时状态条；网页全屏/全屏下由脚本接管滚轮（每次 1%）与上下方向键（每次 5%）调音量，普通模式沿用B站原生逻辑
 // @license      MIT
 // @match        *://bilibili.com/*
@@ -48,9 +48,14 @@
     '#live-player',
     '.live-player-mounter',
   ].join(',');
-  // 直播间播放器根（模式类标在它身上）与真正承载控制栏的那一层（播放器 SDK 运行时创建，隐藏时子节点跟着隐藏）
+  // 直播间播放器根（模式类标在它身上）
   const LIVE_PLAYER_CONTAINER_SELECTOR = '#live-player-ctnr, .live-player-ctnr';
-  const LIVE_CONTROL_BAR_SELECTOR = '.web-player-controller-bg';
+  // 直播间控制栏的候选容器：SDK 版本不同挂载位置会变，逐个试，最后退回整个播放器范围搜索
+  const LIVE_BAR_CANDIDATE_SELECTORS = [
+    '#web-player__bottom-bar__container',
+    '.web-player-controller-bg',
+    '#web-player-controller-wrap-el',
+  ];
   // 直播间按钮自身的尺寸与间距（位置取自锚点，这两个值只决定我们自己的框）
   const LIVE_TOOLBAR_SIZE_PX = 34;
   const LIVE_TOOLBAR_GAP_PX = 6;
@@ -203,6 +208,8 @@
   let toolbarScanScheduled = false;
   let toolbarFullScanAt = 0;
   const toolbarParents = new Set();
+  // 直播间：脚本按钮集合（找不到锚点时要整体隐藏，避免定位未成功时飘在角落）
+  const liveToolbarButtons = new Set();
   const normalizerDefaultMenuIds = new Map();
   const normalizerSpeedMenuIds = new Map();
   const statusHudMenuIds = new Map();
@@ -1278,17 +1285,21 @@
         background: #00aeec;
         box-shadow: 0 0 0 1px rgba(0, 0, 0, .45);
       }
-      /* 直播间：按钮是控制栏的子节点（随控制栏一起显隐），位置由脚本按锚点的实测矩形给出
-         —— 与锚点同一行、紧贴它右侧，因此不管控制栏内部是 flex 还是各控件绝对定位都能对齐。 */
+      /* 直播间：按钮插在原生控件旁边（控制栏子节点，随控制栏一起显隐），
+         位置由脚本按锚点的 offsetLeft/offsetTop/offsetHeight 给出 —— 同排、紧贴其右侧。
+         fx-placed 之前不显示，避免定位还没成功时「飘在角落」。 */
       .${PREFIX}-live-toolbar {
         position: absolute;
         z-index: 14;
-        display: flex !important;
+        display: none;
         align-items: center;
         justify-content: center;
         width: 34px;
         height: 32px;
         color: rgba(255, 255, 255, .9);
+      }
+      .${PREFIX}-live-toolbar.fx-placed {
+        display: flex !important;
       }
       .${PREFIX}-live-toolbar-icon {
         display: flex;
@@ -2283,50 +2294,68 @@
   // 直播间：控制栏内部全是编译后的哈希类名，认不出「音量按钮」，没法照视频页那样按类名定位。
   // 但思路可以照搬：找出控制栏里最靠右的原生控件当锚点，把脚本按钮作为兄弟节点插在它左边，
   // 位置和间距完全交给控制栏自己的布局，不做绝对定位、也不测坐标，因此不会压住原生控件。
-  function findLiveToolbarAnchor(bar) {
-    const barRect = bar.getBoundingClientRect();
-    if (barRect.width < 60 || barRect.height < 12) return null;
-    const maxControlWidth = barRect.width * 0.5;
-    const pickRightmost = (nodes) => nodes.reduce((best, node) => {
-      if (node.closest(`[data-${PREFIX}-toolbar="1"]`)
-        || node.closest(`[data-${PREFIX}-normalizer-toolbar="1"]`)) return best;
+  function findLiveToolbarAnchor(player) {
+    const playerRect = player.getBoundingClientRect();
+    if (playerRect.width < 60 || playerRect.height < 60) return null;
+    // 先在小范围的候选容器里找（SDK 版本不同，控制栏挂在哪一层会变），都找不到再退回整个播放器
+    for (const selector of LIVE_BAR_CANDIDATE_SELECTORS) {
+      const host = player.querySelector(selector) || document.querySelector(selector);
+      if (!host) continue;
+      const anchor = pickRightmostLiveControl(host, playerRect);
+      if (anchor) return anchor;
+    }
+    return pickRightmostLiveControl(player, playerRect, 4000);
+  }
+
+  // 什么算「原生控件」：在播放器底部那一带、尺寸像按钮、不是整层容器的可见元素
+  function isLiveControlCandidate(node, playerRect) {
+    if (node.closest(`[data-${PREFIX}-toolbar="1"]`)
+      || node.closest(`[data-${PREFIX}-normalizer-toolbar="1"]`)) return false;
+    const rect = node.getBoundingClientRect();
+    if (rect.width < 16 || rect.height < 16) return false;
+    // 排除整层容器（画面、弹幕层、控制栏背景层等）
+    if (rect.height > playerRect.height * 0.3 || rect.width > playerRect.width * 0.5) return false;
+    // 只认播放器底部这一带（控制栏所在区域）
+    if (rect.top < playerRect.bottom - playerRect.height * 0.25) return false;
+    if (rect.left < playerRect.left - 1 || rect.right > playerRect.right + 1) return false;
+    return true;
+  }
+
+  function pickRightmostLiveControl(root, playerRect, limit) {
+    let best = null;
+    let seen = 0;
+    for (const node of root.querySelectorAll('*')) {
+      if (limit && ++seen > limit) break;
+      if (!isLiveControlCandidate(node, playerRect)) continue;
       const rect = node.getBoundingClientRect();
-      if (rect.width < 2 || rect.height < 2) return best;
-      // 整行容器宽度接近控制栏，不是单个控件，跳过
-      if (rect.width > maxControlWidth) return best;
-      if (rect.left < barRect.left - 1 || rect.right > barRect.right + 1) return best;
-      if (!best || rect.right > best.right) return { node, right: rect.right };
-      return best;
-    }, null);
-    // 优先取控制栏的直接子节点（与视频页「插在音量按钮左侧」对应的层级），取不到再往深层找
-    const direct = pickRightmost([...bar.children]);
-    if (direct) return direct.node;
-    const deep = pickRightmost([...bar.querySelectorAll('*')]);
-    return deep ? deep.node : null;
+      if (!best || rect.right > best.right) best = { node, right: rect.right };
+    }
+    return best ? best.node : null;
   }
 
   // 直播间：把按钮摆到锚点同一行、紧贴它右侧。
-  // 几何取自锚点自身的实测矩形（锚点是我们按尺寸挑出来的，矩形必然有效），
-  // 所以不管控制栏内部是 flex 流式还是各控件绝对定位，都能落在同一行。
-  function layoutLiveToolbarNextTo(anchor, bar, buttons) {
-    const barRect = bar.getBoundingClientRect();
-    const anchorRect = anchor.getBoundingClientRect();
-    if (barRect.width < 60 || anchorRect.width < 2 || anchorRect.height < 2) return;
-    const totalWidth = buttons.length * LIVE_TOOLBAR_SIZE_PX
-      + (buttons.length - 1) * LIVE_TOOLBAR_GAP_PX;
-    // 锚点右侧放不下就夹回控制栏内，避免越界看不见
-    const maxLeft = Math.max(0, Math.round(barRect.width - totalWidth - 4));
-    const startLeft = Math.min(
-      Math.round(anchorRect.right - barRect.left + LIVE_TOOLBAR_GAP_PX),
-      maxLeft,
-    );
+  // 几何用锚点自己的 offsetLeft / offsetTop / offsetHeight（与锚点同一个 offsetParent 坐标系），
+  // 因此不管控制栏内部是 flex 流式还是各控件绝对定位，都能落在同一行；
+  // 摆好之前按钮不显示（fx-placed），避免出现「飘在角落」的中间状态。
+  function layoutLiveToolbarNextTo(anchor, buttons) {
+    if (!anchor || !anchor.isConnected) return false;
+    const width = LIVE_TOOLBAR_SIZE_PX;
+    const step = width + LIVE_TOOLBAR_GAP_PX;
+    const left = anchor.offsetLeft + anchor.offsetWidth + LIVE_TOOLBAR_GAP_PX;
+    const top = anchor.offsetTop;
+    const height = anchor.offsetHeight;
     buttons.forEach((button, index) => {
-      button.style.left = `${Math.max(0, startLeft
-        + index * (LIVE_TOOLBAR_SIZE_PX + LIVE_TOOLBAR_GAP_PX))}px`;
-      button.style.top = `${Math.round(anchorRect.top - barRect.top)}px`;
-      button.style.width = `${LIVE_TOOLBAR_SIZE_PX}px`;
-      button.style.height = `${Math.round(anchorRect.height)}px`;
+      button.style.left = `${Math.round(left + index * step)}px`;
+      button.style.top = `${Math.round(top)}px`;
+      button.style.width = `${width}px`;
+      button.style.height = `${Math.round(height)}px`;
+      button.classList.add('fx-placed');
     });
+    return true;
+  }
+
+  function hideLiveToolbar(buttons) {
+    for (const button of buttons) button.classList.remove('fx-placed');
   }
 
   // 在同一父节点内保证「音频增强」「动态音量」两个按钮存在（视频页与直播间共用），返回这两个按钮
@@ -2412,18 +2441,22 @@
       }
     }
 
-    // 直播间：控制栏是播放器 SDK 运行时创建的 Svelte 节点，内部类名带哈希、没有 bpx 图标节点，
-    // 认不出「音量按钮」；而且控制栏内部控件是各自绝对定位的，光把它们插进 DOM（流式）不会排在同一行。
-    // 所以分两步：① 作为兄弟节点插进控制栏（结构上属于控制栏，随控制栏一起显隐）；
-    //              ② 几何直接取自锚点自身的实测矩形 —— 与锚点同一行、紧贴它右侧，不受控制栏内部布局方式影响。
-    const liveBar = document.querySelector(LIVE_CONTROL_BAR_SELECTOR);
-    if (liveBar) {
-      const anchor = findLiveToolbarAnchor(liveBar);
-      const parent = (anchor && anchor.parentElement) || liveBar;
-      toolbarParents.add(parent);
-      const { enhancerButton, normalizerButton } = ensureToolbarPair(parent, anchor || liveBar, [], true);
-      const buttons = [enhancerButton, normalizerButton];
-      if (anchor) {
+    // 直播间：控制栏内部是编译后的哈希类名，认不出「音量按钮」，而且它挂在哪一层随 SDK 版本变化。
+    // 做法：① 在整个播放器底部那一带按「位置 + 尺寸」找出最靠右的原生控件当锚点；
+    //       ② 把两个按钮作为兄弟节点插到它右边（结构上属于控制栏，随控制栏一起显隐）；
+    //       ③ 用锚点自己的 offsetLeft / offsetTop / offsetHeight 定位 —— 同排、紧贴其右侧。
+    // 定位成功之前按钮不显示，避免出现「飘在角落」的中间状态。
+    const livePlayer = document.querySelector(LIVE_PLAYER_CONTAINER_SELECTOR)
+      || document.querySelector('#live-player')
+      || null;
+    if (livePlayer) {
+      const anchor = findLiveToolbarAnchor(livePlayer);
+      if (anchor && anchor.parentElement) {
+        const parent = anchor.parentElement;
+        toolbarParents.add(parent);
+        const { enhancerButton, normalizerButton } =
+          ensureToolbarPair(parent, anchor, [], true);
+        const buttons = [enhancerButton, normalizerButton];
         if (enhancerButton.previousElementSibling !== anchor
           || normalizerButton.previousElementSibling !== enhancerButton) {
           // 参照节点只取一次：第一次插入后 anchor.nextElementSibling 就变了
@@ -2431,11 +2464,14 @@
           parent.insertBefore(enhancerButton, after);
           parent.insertBefore(normalizerButton, after);
         }
-        layoutLiveToolbarNextTo(anchor, liveBar, buttons);
-      } else if (parent.lastElementChild !== normalizerButton) {
-        // 控制栏还没渲染出原生控件（隐藏中）时先追加到末尾，等下一次扫描拿到锚点再摆到它右边
-        parent.appendChild(enhancerButton);
-        parent.appendChild(normalizerButton);
+        for (const button of buttons) liveToolbarButtons.add(button);
+        for (const button of [...liveToolbarButtons]) {
+          if (!button.isConnected) liveToolbarButtons.delete(button);
+        }
+        layoutLiveToolbarNextTo(anchor, buttons);
+      } else {
+        // 控制栏隐藏中/还没渲染出原生控件：隐藏按钮，等下一次扫描拿到锚点再摆位
+        hideLiveToolbar(liveToolbarButtons);
       }
     }
 
