@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站清澈人声-音量增强-动态音量平衡
 // @namespace    https://www.bilibili.com/
-// @version      1.15.9
+// @version      1.15.10
 // @description  为B站视频页与直播间播放器加入音频增强、自然响应动态响度平衡及播放器内实时状态条；网页全屏/全屏下由脚本接管滚轮（每次 1%）与上下方向键（每次 5%）调音量，普通模式沿用B站原生逻辑
 // @license      MIT
 // @match        *://bilibili.com/*
@@ -765,23 +765,31 @@
     syncNormalizerPanel(false);
   }
 
-  function setBoostPercent(percent, video = audio.activeVideo || findBestVideo()) {
+  // 注意视频参数：兜底求值必须放在函数体里。拖 B站 音量条时 volumechange 触发得很密，
+  // 写成默认参数的话每次调用都会先跑一次 findBestVideo()（要读布局），纯属白费。
+  function setBoostPercent(percent, video) {
     const next = clamp(Math.round(percent), BOOST_MIN_PERCENT, BOOST_MAX_PERCENT);
     if (next === settings.boostPercent) return;
+    const targetVideo = video || audio.activeVideo || findBestVideo();
     settings.boostPercent = next;
     if (next > BOOST_MIN_PERCENT) {
       const graphReady = Boolean(audio.ctx && audio.nodes && audio.activeSource
-        && audio.activeVideo === video && audio.ctx.state === 'running');
-      if (!graphReady && !ensureAudioForVideo(video)) {
+        && audio.activeVideo === targetVideo && audio.ctx.state === 'running');
+      if (!graphReady && !ensureAudioForVideo(targetVideo)) {
         // 音频链路创建失败时回退，避免界面显示已增强但实际没生效
         settings.boostPercent = BOOST_MIN_PERCENT;
         applyBoostSettings();
         syncBoostReadout();
+        scheduleVolumeReadoutSync(lastVolumeControl);
         return;
       }
     }
     applyBoostSettings();
     syncBoostReadout();
+    // B站 音量面板里的数字由脚本改写（100% 以上显示增强倍率）。倍率变了就必须重写一次，
+    // 否则会停在旧倍率：点面板上的「滚轮增强」重置、或原生音量被拉到 100% 以下导致增强归零，
+    // 这两条路径都不经过 adjustPlayerVolume，而 mouseover 那条补偿在倍率回到 100% 后就不再生效。
+    scheduleVolumeReadoutSync(lastVolumeControl);
   }
 
   let volumeReadoutElement = null;
@@ -837,11 +845,39 @@
     });
   }
 
+  function isFullscreenPlayback() {
+    return Boolean(document.fullscreenElement || document.webkitFullscreenElement
+      || document.mozFullScreenElement || document.msFullscreenElement);
+  }
+
+  // 直播间沉浸模式的廉价信号：只读播放器根的类名，不做任何 video 查询
+  function hasLiveImmersiveHint() {
+    for (const id of ['live-player', 'live-player-ctnr']) {
+      const root = document.getElementById(id);
+      if (!root) continue;
+      const names = String(root.className || '').split(/\s+/).filter(Boolean);
+      if (names.some((name) => LIVE_IMMERSIVE_CLASS_PATTERN.test(name))) return true;
+    }
+    return false;
+  }
+
+  // 沉浸模式的「廉价信号」：给 window 捕获阶段的滚轮监听做前置门槛用（B站 每个页面的每次滚动都会收到事件，
+  // 而 findVolumeControl 里的 [class*=volume] 子串查找是本页最贵的一类查询）。
+  // 它覆盖 isImmersivePlayback 里所有不依赖 video / player 实参的判据，所以：只要这里全部不命中，
+  // isImmersivePlayback 就不可能返回 true，滚轮那条路上后面那些昂贵查找的结论也不会改变。
+  function hasImmersiveHint() {
+    if (isFullscreenPlayback()) return true;
+    if (hasLiveImmersiveHint()) return true;
+    if (document.body && /webfull|web-full|fullscreen|screen-full/i.test(document.body.className)) return true;
+    return Boolean(document.querySelector(
+      '.bpx-player-container[data-screen="web"], .bpx-player-container[data-screen="full"]',
+    ));
+  }
+
   // 仅在「网页全屏 / 全屏」下由脚本接管滚轮；普通、宽屏、小窗等模式交回 B站 原生滚轮逻辑。
   // 依次判断：原生全屏 API → 直播间模式类 → B站播放器 data-screen 属性 → 类名兜底 → 播放器是否铺满视口。
   function isImmersivePlayback(video, player) {
-    if (document.fullscreenElement || document.webkitFullscreenElement
-      || document.mozFullScreenElement || document.msFullscreenElement) return true;
+    if (isFullscreenPlayback()) return true;
 
     // 直播间：播放器根是 #live-player-ctnr（「网页模式」「全屏模式」都不改它的类名，实测走元素全屏）
     const liveContainer = (video && video.closest && video.closest(LIVE_PLAYER_CONTAINER_SELECTOR))
@@ -910,13 +946,16 @@
     if (!Number.isFinite(event.deltaY) || event.deltaY === 0 || event.ctrlKey || event.metaKey) return;
     const target = event.target instanceof Element ? event.target : null;
     if (!target) return;
+    // 廉价门槛先过：这个监听挂在 window 捕获阶段，B站 每个页面的每次滚动都会进来。不在播放器里、
+    // 也不是 video 本身、且没有任何沉浸信号时，脚本肯定不会接管（isImmersivePlayback 也返回 false），
+    // 直接返回即可省掉 findVolumeControl 里的 [class*=volume] 子串查找 —— 本页最贵的一类查询。
     const player = target.closest(PLAYER_SELECTOR);
+    const directTargetVideo = target instanceof HTMLVideoElement ? target : null;
+    if (!player && !directTargetVideo && !hasImmersiveHint()) return;
     const directVolumeControl = findVolumeControl(target);
     // 只接管播放器内部；独立 video 元素也可以直接调节。
-    if (!player && !directVolumeControl && !(target instanceof HTMLVideoElement)) return;
-    const video = target instanceof HTMLVideoElement
-      ? target
-      : findVideoForControl(player || directVolumeControl, !player);
+    if (!player && !directVolumeControl && !directTargetVideo) return;
+    const video = directTargetVideo || findVideoForControl(player || directVolumeControl, !player);
     if (!video) return;
     // 非网页全屏/全屏时不拦截事件，交由 B站 原生滚轮调音量逻辑处理
     if (!isImmersivePlayback(video, player)) return;
@@ -1078,6 +1117,15 @@
   function keepAudioPathAlive() {
     // 没用过增强（音频图没建、也没有已保存的增强）：完全不做任何事，不给页面加负担
     if (document.hidden || (!audio.ctx && !hasSavedEffect())) return;
+
+    // 稳态：当前音源就在播、没被静音 —— 这时只需要保证上下文是 running，不必每秒扫一遍页面里的视频
+    // （findPlayingVideo 里的 isVisible 会读布局）。只有「看起来不对劲」时才走下面的完整检查。
+    const active = audio.activeVideo;
+    if (audio.ctx && active && active.isConnected && !active.paused
+      && !active.muted && active.volume > 0) {
+      if (audio.ctx.state !== 'running') audio.ctx.resume().catch(() => {});
+      return;
+    }
 
     const playing = findPlayingVideo();
     if (!playing) return;
@@ -1666,6 +1714,15 @@
       return;
     }
 
+    // 可见性判断（要读布局）提到数值写入之前：状态条隐藏时（直播间控制栏只在 hover 时挂载，这是常态）
+    // 不必每 200ms 先把数值与仪表写一遍、下一行再把它藏起来。
+    const video = findBestVideo();
+    const videoRect = getPlayerRect(video);
+    if (!videoRect || !isStatusControlVisible(video)) {
+      hideStatusHud();
+      return;
+    }
+
     ensureStatusHud();
     const segments = [
       [statusRefs.dynamic, dynamicActive],
@@ -1723,13 +1780,6 @@
     if (voiceActive) {
       const voiceNames = { a: 'A 轻柔', b: 'B 原生', c: 'C 强化' };
       statusRefs.voiceValue.textContent = voiceNames[settings.voicePreset] || settings.voicePreset.toUpperCase();
-    }
-
-    const video = findBestVideo();
-    const videoRect = getPlayerRect(video);
-    if (!videoRect || !isStatusControlVisible(video)) {
-      hideStatusHud();
-      return;
     }
 
     const host = document.fullscreenElement || document.webkitFullscreenElement
@@ -1944,6 +1994,10 @@
   }
 
   function closeFloatingPanel(target, currentTimer) {
+    // 面板与原生右键菜单是两条交互路径：点脚本自己的菜单项时会先把原生菜单藏起来（见 hideNativeMenu），
+    // 所以关闭面板时顺带把它放出来，否则恢复时机只剩「下一次在播放器上右键」那一条。
+    // 用标记位挡在前面：没藏过菜单时（常见路径）这里只做一次布尔判断。
+    if (hiddenNativeMenuPending) restoreHiddenNativeMenus();
     if (!target || target.style.display === 'none') return currentTimer;
     target.classList.remove('fx-open');
     syncToolbarButtons();
@@ -2627,7 +2681,12 @@
     for (const element of root.querySelectorAll('[id]')) element.removeAttribute('id');
   }
 
+  // 「原生菜单是否被脚本藏过」的标记：恢复函数会被每次关闭面板调到，用这个标记让常见路径零成本
+  let hiddenNativeMenuPending = false;
+
   function restoreHiddenNativeMenus() {
+    if (!hiddenNativeMenuPending) return;
+    hiddenNativeMenuPending = false;
     for (const menu of document.querySelectorAll(`[data-${PREFIX}-hidden="1"]`)) {
       menu.style.removeProperty('display');
       menu.removeAttribute(`data-${PREFIX}-hidden`);
@@ -2635,8 +2694,10 @@
   }
 
   function hideNativeMenu(menu) {
+    // !important 会压过 B站 自己写的 inline display，所以恢复必须显式做，不能指望页面自己重置
     menu.style.setProperty('display', 'none', 'important');
     menu.setAttribute(`data-${PREFIX}-hidden`, '1');
+    hiddenNativeMenuPending = true;
   }
 
   function bindScriptMenuItem(item, menu, panelType) {
@@ -2654,9 +2715,14 @@
       const video = lastContextVideo || findBestVideo();
       hideNativeMenu(menu);
       setTimeout(() => {
-        if (panelType === 'normalizer') showNormalizerPanel(video);
-        else showPanel(video);
-        activated = false;
+        // try/finally：面板打开过程里任何一步抛异常（例如取 offsetWidth / focus 时），
+        // 不复位 activated 就会让这个菜单项此后永远点不动（两个处理器都在第一行 return），只能刷新页面。
+        try {
+          if (panelType === 'normalizer') showNormalizerPanel(video);
+          else showPanel(video);
+        } finally {
+          activated = false;
+        }
       }, 0);
     };
 

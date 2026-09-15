@@ -149,6 +149,29 @@
 
 > 更新记录按照从新到旧排列。早期开发过程中部分中间文件已经被后续版本覆盖，因此无法可靠恢复每一个小版本号；下面对已确认的版本使用准确版本号，不补写无法确认的版本号。
 
+### 1.15.10
+
+> 一次全文件复查的结果（子代理扫描 + 逐条回代码核实），7 处都是小改动、不改架构。
+
+**功能 bug**
+
+- **原生音量读数会停在旧倍率**（用户可见）：`setBoostPercent()` 改了 `settings.boostPercent` 却不刷新 B站 音量面板里的数字。刷新的两条路径分别是 `adjustPlayerVolume()`（自带同步）和 hover 音量控件时的 mouseover 补偿，而后者有 `if (settings.boostPercent <= BOOST_MIN_PERCENT) return;` —— 倍率一回到 100%，它就再也不跑了。于是「点面板上的『滚轮增强』重置」和「在 B站 音量条上把音量拉到 100% 以下导致增强自动归零」这两条路径之后，面板会继续显示旧的增强倍率（例如停住 640%），实际音量已经回到 100%。现在 `setBoostPercent()` 结束时统一补一次读数同步。
+- **注入的菜单项可能整场失效**：`bindScriptMenuItem()` 里的 `activated` 守卫只在 `setTimeout` 回调末尾复位，回调里 `showPanel` / `showNormalizerPanel` 一旦抛异常（`openFloatingPanel` 会碰 `offsetWidth`、`focus()`、`document.body`），`activated` 就永远是 `true`，两个处理器都在第一行 `return` —— 「音频增强（状态版）」此后点不动，只能刷新页面。改成 `try { … } finally { activated = false; }`。
+- **原生右键菜单的恢复只有一条路径**：`restoreHiddenNativeMenus()` 原先只在 `install()` 的 contextmenu 捕获监听里被调用，而它在「右键落在脚本面板内」时会提前 return；面板的关闭路径（`closePanel` / `closeNormalizerPanel` / Escape）都不恢复。脚本是用 `display:none !important` 藏原生菜单的，`!important` 会压过 B站 自己写的 inline `display`，所以最坏情况是「某次右键原生菜单不显示，需要再右键一次」。现在 `closeFloatingPanel()`（两条关闭路径的共同出口）里也恢复，并加了 `hiddenNativeMenuPending` 标记位让常见路径只做一次布尔判断、不做属性查询。
+
+**性能（行为不变）**
+
+- **滚轮热路径**：`handleVolumeWheel` 挂在 window 捕获阶段，**B站 每个页面的每次滚动都会进来**，而它原先在判断「是否沉浸模式」之前就跑了 `findVolumeControl()` —— 里面是 `[class*=ctrl-volume]`、`[class*=volume-panel]`、`[class*=volume-slider]` 这类子串选择器的 `closest`，外加兜底 `[class*=volume]`。现在先过一道廉价门槛（`closest(PLAYER_SELECTOR)` + `hasImmersiveHint()`），非播放器、非 video、且没有任何沉浸信号的普通页面滚动直接返回。`hasImmersiveHint()` 覆盖了 `isImmersivePlayback()` 里所有不依赖 `video` / `player` 实参的判据（全屏 API → 直播间根类名 → 页面类名 → `.bpx-player-container[data-screen]`），所以门槛不命中时原逻辑的结论也不会变。
+- **状态条先写 DOM 再判断该不该显示**：`syncStatusHud()` 原先每 200ms 先写约 8 处 `textContent`/`style`，之后才做 `findBestVideo()` + `getPlayerRect()` + `isStatusControlVisible()`（后者还要对每个按钮沿祖先链 `getComputedStyle`）。而直播间控制栏只在 hover 时挂载、状态条绝大多数时间是隐藏的 —— 现在可见性判断提到写入之前，隐藏时只剩一次布局读。
+- **音源看护的稳态空转**：`keepAudioPathAlive()` 每秒都会扫一遍页面里的视频（`findPlayingVideo()` 里 `isVisible` 要读布局）。现在加一条稳态捷径：当前音源在播、未静音 → 只检查上下文是否 `running` 就返回，只有「看起来不对劲」时才做完整扫描。
+- **`setBoostPercent()` 的默认参数被提前求值**：`video = audio.activeVideo || findBestVideo()` 写成默认参数时，`handleVolumeChange()` 那条省略参数的调用会在**每次 `volumechange`**（拖音量条时很密）都白跑一次 `findBestVideo()`。兜底挪进函数体，用到时才求值。
+
+**复查结论（核实后不算 bug，留档免得以后重复怀疑）**
+
+- `updateMenuCommand()` 用 `options.id` **原地更新**油猴菜单命令，不会堆叠重复项；全程没用 `GM_unregisterMenuCommand` 也不需要。
+- `install()` 只被调用一次，事件监听 / 两个定时器 / MutationObserver 都不会重复注册；`if (!statusHudTimer)` 这类判断是冗余而非缺陷。
+- 状态条只在「脚本两个按钮可见」时显示（`isStatusControlVisible`），而直播间按钮只在控制栏 hover 挂载时存在 ⇒ 鼠标移开状态条就消失、视频页随控制栏闪烁折叠。这是当前设计（要常显就得改这条判据），不是 bug。
+
 ### 1.15.9
 
 - **修复直播间「音频一会有一会无」**（反馈：看直播时声音时有时无）。根因是脚本的「音源接管」会被页面里的**杂项 `<video>`** 触发：实测直播间（无脚本埋点 24s + 事件时间线）——主播放器 `<video>`（866×487、`blob:` MSE）稳定播放且元素不重建，但页面**自己会周期性创建并播放第二个 video**：`0×0`、`display:none`、`muted`、`volume: 0`，`src` 指向 `i0.hdslb.com/bfs/live/bc…`，父节点 `.supportWebp`（B站 自己的功能探测元素），实测 `play` → `waiting` → `playing`（t=47.0s）→ 3 秒后 `pause`。脚本在 document 捕获阶段监听 `play`/`playing`，对该类视频没有任何过滤，于是走了「切换音源」：给探测视频建 `MediaElementSource`，并 **`disconnect()` 掉主播放器的 source**。而 `createMediaElementSource` 是不可逆的 —— 元素一旦被接管，声音就只能经由脚本的音频图输出，source 一断等于**彻底没声**（元素还在播）；直播流又很少再触发 `play`/`playing`，声音就一直回不来，直到某次事件把它切回来 —— 表现就是「一会有一会无」。
