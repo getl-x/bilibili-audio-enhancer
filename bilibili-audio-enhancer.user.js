@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站清澈人声-音量增强-动态音量平衡
 // @namespace    https://www.bilibili.com/
-// @version      1.15.8
+// @version      1.15.9
 // @description  为B站视频页与直播间播放器加入音频增强、自然响应动态响度平衡及播放器内实时状态条；网页全屏/全屏下由脚本接管滚轮（每次 1%）与上下方向键（每次 5%）调音量，普通模式沿用B站原生逻辑
 // @license      MIT
 // @match        *://bilibili.com/*
@@ -232,6 +232,7 @@
   let statusHud = null;
   let statusRefs = {};
   let statusHudTimer = null;
+  let audioKeepAliveTimer = null;
   let displayedLoudness = null;
   let displayedNormalizerGain = 0;
   const statusHudMetrics = {
@@ -970,6 +971,29 @@
     if (settings.boostPercent > BOOST_MIN_PERCENT) setBoostPercent(BOOST_MIN_PERCENT);
   }
 
+  // 仅供自动接管（play / playing / 点击页面）使用的安全门槛。
+  // B站 页面里除了播放器本身还会冒出别的 video：B站 自己的 0×0 功能探测视频（src 指向 i0.hdslb.com/bfs/live/… 、
+  // 0×0、display:none、muted、volume 0，父节点 .supportWebp；实测在直播间约每半分钟自己 play 一次）、
+  // 推荐位悬停预览……它们同样会触发 play / playing。一旦让它们接管音源，真正在播的主视频就会被
+  // disconnect 掉（原因见 ensureAudioForVideo 的注释），而直播流又很少再触发 play / playing，
+  // 声音就一直回不来 —— 表现就是「音频一会有一会无」。
+  // 所以自动接管只认「可见、非静音、且当前没有别的视频正在出声」的视频。
+  // 用户在播放器上的显式操作（滚轮 / 方向键调音量、点击脚本按钮）不走这道门槛，仍按原逻辑直接建链路。
+  function shouldAdoptVideo(video) {
+    if (!(video instanceof HTMLVideoElement) || !video.isConnected) return false;
+    if (video.muted || video.volume === 0) return false;
+    if (!isVisible(video)) return false;
+    const active = audio.activeVideo;
+    if (active && active !== video && isVisible(active) && !active.paused && !active.ended) return false;
+    return true;
+  }
+
+  function describeVideo(video) {
+    const rect = video.getBoundingClientRect();
+    return `${video.id || video.className || 'video'} `
+      + `${Math.round(rect.width)}×${Math.round(rect.height)} volume=${video.volume} muted=${video.muted}`;
+  }
+
   function ensureAudioForVideo(video) {
     if (!video) {
       audio.error = '没有找到当前视频元素';
@@ -985,13 +1009,15 @@
       }
 
       if (source !== audio.activeSource) {
-        if (audio.activeSource) {
-          try { audio.activeSource.disconnect(); } catch (error) {}
-        }
+        // 这里**不能**断开上一个 source：createMediaElementSource 是不可逆的 —— 元素一旦被接管，它的声音就
+        // 只能经由本图输出，把 source 断掉等于让那个元素彻底没声（元素还在播，但听不到）。保留旧连线，
+        // 保证任何被接管过的元素永远有通往 destination 的通路；同一时刻只有一个视频在出声，不会叠加音量
+        // （Web Audio 对同一对节点的重复连接会被忽略）。之前这里是 disconnect()，正是直播间「音频一会有一会无」的根源。
         source.connect(audio.nodes.input);
         audio.activeSource = source;
         audio.activeVideo = video;
         resetLoudnessState(true);
+        console.info(`[${PREFIX}] 音源已接管：${describeVideo(video)}`);
       }
 
       applyAudioSettings();
@@ -1008,7 +1034,7 @@
   }
 
   async function autoApplySavedEffect(video, allowPaused = false) {
-    if (!(video instanceof HTMLVideoElement) || !hasSavedEffect() || autoApplyingVideos.has(video)) return;
+    if (!shouldAdoptVideo(video) || !hasSavedEffect() || autoApplyingVideos.has(video)) return;
 
     autoApplyingVideos.add(video);
     try {
@@ -1025,6 +1051,42 @@
     } finally {
       autoApplyingVideos.delete(video);
     }
+  }
+
+  // 音源看护（低频兜底）：被接管过的元素可能被页面重建，AudioContext 也可能因为系统/输出设备切换被挂起，
+  // 而直播流很少再触发 play / playing，脚本一旦错过这些时机就再也不会自己切回来。
+  // 这里每秒检查一次：把挂起的上下文唤醒、把「真正在出声的那个视频」接上，让音源自己恢复。
+  // 只有真正用过增强（音频图已建立，或本页有已保存的增强设置）时才运行，平时完全不跑，不给页面加负担。
+  const AUDIO_KEEPALIVE_MS = 1000;
+
+  function findPlayingVideo() {
+    let best = null;
+    let bestArea = 0;
+    for (const video of document.querySelectorAll('video')) {
+      if (video.muted || video.volume === 0 || video.paused || video.ended) continue;
+      if (!isVisible(video)) continue;
+      const rect = video.getBoundingClientRect();
+      const area = rect.width * rect.height;
+      if (area > bestArea) {
+        best = video;
+        bestArea = area;
+      }
+    }
+    return best;
+  }
+
+  function keepAudioPathAlive() {
+    // 没用过增强（音频图没建、也没有已保存的增强）：完全不做任何事，不给页面加负担
+    if (document.hidden || (!audio.ctx && !hasSavedEffect())) return;
+
+    const playing = findPlayingVideo();
+    if (!playing) return;
+    if (audio.ctx && audio.ctx.state !== 'running') audio.ctx.resume().catch(() => {});
+    if (playing === audio.activeVideo || !shouldAdoptVideo(playing)) return;
+    // 音频图已建立就直接接上；还没建立（例如开头被自动播放策略静音、用户后来才点「取消静音」）
+    // 走自动接管流程，是否建图由 hasSavedEffect() 决定。
+    if (audio.ctx) ensureAudioForVideo(playing);
+    else autoApplySavedEffect(playing);
   }
 
   function ensureStyles() {
@@ -2670,6 +2732,10 @@
     registerWheelVolumeMenu();
     if (!statusHudTimer) {
       statusHudTimer = setInterval(syncStatusHud, STATUS_HUD_UPDATE_MS);
+    }
+    // 音源看护：接管过的元素被页面重建、或音频上下文被系统挂起时，自己把声音接回来（见 keepAudioPathAlive）
+    if (!audioKeepAliveTimer) {
+      audioKeepAliveTimer = setInterval(keepAudioPathAlive, AUDIO_KEEPALIVE_MS);
     }
     document.addEventListener('contextmenu', (event) => {
       if ((panel && panel.contains(event.target))
