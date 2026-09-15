@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         B站清澈人声-音量增强-动态音量平衡
 // @namespace    https://www.bilibili.com/
-// @version      1.15.10
-// @description  为B站视频页与直播间播放器加入音频增强、自然响应动态响度平衡及播放器内实时状态条；网页全屏/全屏下由脚本接管滚轮（每次 1%）与上下方向键（每次 5%）调音量，普通模式沿用B站原生逻辑
+// @version      1.15.11
+// @description  为B站视频页与直播间播放器加入音频增强、自然响应动态响度平衡及播放器内实时状态条；网页全屏/全屏下由脚本接管滚轮（每次 5%）与上下方向键（每次 10%）调音量，普通模式沿用B站原生逻辑
 // @license      MIT
 // @match        *://bilibili.com/*
 // @match        *://*.bilibili.com/*
@@ -33,9 +33,10 @@
   const BOOST_MAX_PERCENT = 1000;
   const BOOST_STEP_RATIO = 1.1;
   const WHEEL_VOLUME_DEFAULT_KEY = `${STORAGE_PREFIX}:wheel-volume-default-enabled`;
-  // 100% 以内每次调整的档位：滚轮 1%，上下方向键 5%（贴近 B站 原生手感）
-  const VOLUME_STEP_PERCENT = 1;
-  const VOLUME_KEY_STEP_PERCENT = 5;
+  // 100% 以内每次调整的档位：滚轮 5%，上下方向键 10%（用户指定；比 B站 原生手感粗，长按由
+  // VOLUME_KEY_REPEAT_INTERVAL_MS 限流）
+  const VOLUME_STEP_PERCENT = 5;
+  const VOLUME_KEY_STEP_PERCENT = 10;
   const VOLUME_KEY_REPEAT_INTERVAL_MS = 90;
   // 视频页（bpx 播放器）与直播间（#live-player-ctnr / #live-player）的播放器根
   const PLAYER_SELECTOR = [
@@ -969,7 +970,7 @@
 
   let lastVolumeKeyAt = 0;
 
-  // 只在网页全屏/全屏下接管上下方向键调音量（每次 5%），普通模式交回 B站 原生逻辑。
+  // 只在网页全屏/全屏下接管上下方向键调音量（每次 10%），普通模式交回 B站 原生逻辑。
   function handleVolumeKey(event) {
     if (!settings.wheelVolumeEnabled) return;
     if (event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
@@ -2311,7 +2312,7 @@
       registerWheelVolumeMenu();
     }, {
       autoClose: false,
-      title: '切换新视频打开时是否默认允许在网页全屏/全屏下用滚轮（每次 1%）或上下方向键（每次 5%）调节播放器音量（默认开启）',
+      title: '切换新视频打开时是否默认允许在网页全屏/全屏下用滚轮（每次 5%）或上下方向键（每次 10%）调节播放器音量（默认开启）',
     });
   }
 
